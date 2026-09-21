@@ -32,7 +32,7 @@ export async function resolveBuiltinProviderBuildEnvironment({
       if (parsed.ZCODE_ENV !== undefined) value = parsed.ZCODE_ENV;
     }
   }
-  const normalized = value?.trim().toLowerCase() || "test";
+  const normalized = value?.trim().toLowerCase() || "production";
   if (normalized !== "test" && normalized !== "production") {
     throw new Error(`Invalid ZCODE_ENV for Built-in Provider build: ${normalized}`);
   }

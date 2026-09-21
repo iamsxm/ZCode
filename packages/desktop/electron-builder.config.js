@@ -204,7 +204,10 @@ function resolveElectronDownloadMirror(env = process.env) {
 
 const commandStdoutMaxBuffer = 64 * 1024 * 1024;
 // 产物后缀只标记后端环境（_TEST）；身份靠 productName 区分，生产后端的 Preview 包没有后缀。
-const desktopArtifactEnvSuffix = resolveDesktopArtifactSuffix(process.env);
+const desktopArtifactEnvSuffix = resolveDesktopArtifactSuffix({
+  ...process.env,
+  ZCODE_ENV: process.env.ZCODE_ENV || builtinProviderConfig.environment,
+});
 
 // Preview 是内部签名测试包。CI 明确打开 macOS 签名时若没有身份，必须在生成未签名包前失败，
 // 避免“产物存在”被误认为已经走完和生产版相同的签名链路。

@@ -66,6 +66,7 @@ jobs:
 
       - name: Build agent CLI and workspace dependencies
         env:
+          ZCODE_ENV: 'production'
           ZCODE_SKIP_REMOTE_ASSETS: '1'
         run: |
           node scripts/build-desktop-agent-cli.mjs
@@ -74,6 +75,7 @@ jobs:
 
       - name: Build Desktop Installer (${{ matrix.platform }}-${{ matrix.arch }})
         env:
+          ZCODE_ENV: 'production'
           ZCODE_SKIP_REMOTE_ASSETS: '1'
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
