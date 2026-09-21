@@ -761,7 +761,5 @@ export default {
     owner: "iamsxm",
     repo: "ZCode",
     releaseType: "release",
-    // 关闭 multiple range，使用按单 Range 顺序拉取，避免 Windows 用户更新退化为全量包
-    useMultipleRangeRequest: false,
   },
 };
