@@ -1,0 +1,67 @@
+name: Sync Upstream
+
+on:
+  schedule:
+    # 每天 UTC 00:00 (北京时间 08:00) 自动执行同步
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: 'Upstream repository URL (e.g. https://github.com/upstream-owner/repo.git)'
+        required: false
+        default: ''
+      upstream_branch:
+        description: 'Upstream branch to sync from'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          INPUT_UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          VARS_UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+          VARS_UPSTREAM_BRANCH: ${{ vars.UPSTREAM_BRANCH }}
+        run: |
+          UPSTREAM_REPO="${INPUT_UPSTREAM_REPO:-${VARS_UPSTREAM_REPO}}"
+          UPSTREAM_BRANCH="${INPUT_UPSTREAM_BRANCH:-${VARS_UPSTREAM_BRANCH:-main}}"
+
+          if [ -n "$UPSTREAM_REPO" ]; then
+            echo "==> Syncing from configured upstream: ${UPSTREAM_REPO} (${UPSTREAM_BRANCH})"
+            git remote add upstream "${UPSTREAM_REPO}" || git remote set-url upstream "${UPSTREAM_REPO}"
+            git fetch upstream "${UPSTREAM_BRANCH}"
+            git merge upstream/"${UPSTREAM_BRANCH}" --no-edit -m "chore: sync upstream changes from ${UPSTREAM_BRANCH}" || {
+              echo "::error::Merge conflict encountered when syncing from upstream. Please resolve manually."
+              exit 1
+            }
+            git push origin HEAD:${UPSTREAM_BRANCH}
+          else
+            echo "==> No explicit UPSTREAM_REPO provided, attempting 'gh repo sync' (for GitHub Fork)..."
+            if gh repo sync --branch "${UPSTREAM_BRANCH}"; then
+              echo "Successfully synced using gh repo sync."
+            else
+              echo "::warning::gh repo sync failed or this repository is not a GitHub fork."
+              echo "Please configure the repository variable 'UPSTREAM_REPO' or provide it in workflow_dispatch."
+              exit 1
+            fi
+          fi
