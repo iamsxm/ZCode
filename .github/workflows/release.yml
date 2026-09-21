@@ -14,15 +14,42 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
-    name: Build Windows Installer
-    runs-on: windows-latest
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            arch: x64
+            name: Windows-x64
+          - os: macos-14
+            platform: mac
+            arch: arm64
+            name: macOS-AppleSilicon
+          - os: macos-13
+            platform: mac
+            arch: x64
+            name: macOS-Intel
+          - os: ubuntu-22.04
+            platform: linux
+            arch: x64
+            name: Linux-x64
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           submodules: recursive
+
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm libarchive-tools
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -49,31 +76,61 @@ jobs:
           pnpm -r --filter "./packages/*" --filter "!@zcode/desktop" build
           node scripts/prepare-native-search-tools.mjs
 
-      - name: Build Windows Desktop Installer
+      - name: Build Desktop Installer (${{ matrix.platform }}-${{ matrix.arch }})
         env:
           ZCODE_SKIP_REMOTE_ASSETS: '1'
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
-        run: pnpm bundle:desktop -- --os win --arch x64
+        run: pnpm bundle:desktop -- --os ${{ matrix.platform }} --arch ${{ matrix.arch }}
 
-      - name: Upload Installer Artifact
+      - name: Organize build artifacts
+        shell: bash
+        run: |
+          mkdir -p dist-artifacts
+          # 收集 Windows 安装包及更新配置
+          find packages/desktop/dist -maxdepth 1 \( -name "*.exe" -o -name "*.blockmap" -o -name "latest.yml" \) -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          # 收集 macOS 安装包及更新配置
+          find packages/desktop/dist -maxdepth 1 \( -name "*.dmg" -o -name "*.zip" -o -name "latest-mac.yml" \) -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          # 收集 Linux 安装包及更新配置
+          find packages/desktop/dist -maxdepth 1 \( -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" -o -name "latest-linux.yml" \) -exec cp {} dist-artifacts/ \; 2>/dev/null || true
+          ls -la dist-artifacts/
+
+      - name: Upload Platform Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: zcode-windows-installer
-          path: |
-            packages/desktop/dist/*.exe
-            packages/desktop/dist/*.blockmap
-            packages/desktop/dist/latest.yml
+          name: zcode-artifacts-${{ matrix.name }}
+          path: dist-artifacts/*
           if-no-files-found: error
 
-      - name: Publish Release
+  publish:
+    name: Publish GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          merge-multiple: true
+
+      - name: Display downloaded files
+        run: |
+          echo "==> Downloaded release files:"
+          ls -la all-artifacts/
+
+      - name: Generate SHA-256 Checksums
+        working-directory: all-artifacts
+        run: |
+          # 为所有可分发二进制文件生成校验和，排除清单和 blockmap
+          find . -maxdepth 1 -type f \( -name "*.exe" -o -name "*.dmg" -o -name "*.zip" -o -name "*.AppImage" -o -name "*.deb" -o -name "*.rpm" -o -name "*.pkg.tar.zst" \) -exec sha256sum {} + > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt || true
+
+      - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           files: |
-            packages/desktop/dist/*.exe
-            packages/desktop/dist/*.blockmap
-            packages/desktop/dist/latest.yml
+            all-artifacts/*
           generate_release_notes: true
           draft: false
           prerelease: false
