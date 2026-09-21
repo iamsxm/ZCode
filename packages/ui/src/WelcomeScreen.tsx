@@ -89,7 +89,8 @@ function LoginPanel({ active, onComplete }: LoginPanelProps) {
   const loginEntryRequest = useZCodeStore((s) => s.loginEntryRequest);
   const clearLoginEntryRequest = useZCodeStore((s) => s.clearLoginEntryRequest);
   const markLoginEntryAttemptStatus = useZCodeStore((s) => s.markLoginEntryAttemptStatus);
-  const [loginMode, setLoginMode] = useState<"providers" | "apiKey">("providers");
+  // 仅保留 API Key 登录，默认进入 apiKey 模式
+  const [loginMode, setLoginMode] = useState<"providers" | "apiKey">("apiKey");
   const wasActiveRef = useRef(active);
   const consumedLoginRequestRef = useRef<number | null>(null);
   const observedOAuthSuccessSeqRef = useRef(oauthSuccessSeq);
@@ -244,7 +245,8 @@ function LoginPanel({ active, onComplete }: LoginPanelProps) {
   ]);
 
   const resetApiKeyForm = useCallback(() => {
-    setLoginMode("providers");
+    // 仅保留 API Key 登录，重置时依然保持 apiKey 模式
+    setLoginMode("apiKey");
   }, []);
 
   useEffect(() => {
@@ -356,7 +358,7 @@ function LoginPanel({ active, onComplete }: LoginPanelProps) {
 
         {status === "idle" && loginMode === "apiKey" ? (
           <LoginApiKeyForm
-            onCancel={() => setLoginMode("providers")}
+            showCancel={false}
             onSaved={() => {
               resetApiKeyForm();
               return onComplete("apiKey");
@@ -537,11 +539,12 @@ function getProviderPriority(provider: OAuthProviderMeta): number {
 }
 
 function resolveVisibleLoginProviders(providers: OAuthProviderMeta[]): OAuthProviderMeta[] {
-  // ZAI / BigModel 现在共享 App 登录事实源，未登录时登录入口必须同时展示两个入口。
-  // 不能临时隐藏 BigModel，否则用户无法主动选择 BigModel 作为 active provider。
-  return [...providers].sort((left, right) => {
-    return getProviderPriority(left) - getProviderPriority(right);
-  });
+  // 移除 z.ai 登录选项，仅保留其他渠道（若有）
+  return [...providers]
+    .filter((provider) => provider.id !== ZAI_PROVIDER_ID)
+    .sort((left, right) => {
+      return getProviderPriority(left) - getProviderPriority(right);
+    });
 }
 
 function resolveLoginRetryProvider({
