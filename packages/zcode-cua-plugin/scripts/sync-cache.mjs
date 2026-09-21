@@ -25,7 +25,16 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 const devPlugin = packageRoot;
 // Build artifacts that constitute an installed plugin in the cache.
-const ENTRIES = ["skills", "dist", ".zcode-plugin", "package.json"];
+const ENTRIES = [
+  "skills",
+  "docs",
+  "scripts/computer-use-client.mjs",
+  ".zcode-plugin",
+  "package.json",
+  // CUA screenshot/zoom 的 sharp native closure 属于 CUA plugin 自身；同步开发缓存时
+  // 不能只复制 skill/docs，否则下一次 cache seed 会再次丢失原生依赖。
+  "node_modules",
+];
 
 /**
  * Resolve the CLI cache dir for zcode-cua. Prefer the cachePath declared in the

@@ -1,172 +1,306 @@
 ---
 name: computer-use
-description: Main-agent-only desktop control through accessibility-first semantic actions with visual pixel fallback only when accessibility cannot reach the target.
+description: "Use when a task needs a native desktop app's own UI or the OS. For anything inside a web page, use Browser Use. Main agent only."
 ---
 
-# ZCode Computer Use
+# Computer Use
 
-Main agent only. Never delegate Computer Use to a subagent.
+Read or operate the UI of native apps on the user's computer.
 
-## Core loop
+- Prefer a dedicated connector, API, CLI or skill when one can complete the task.
+- For browser and web tasks, use Browser Use instead.
+- Do not use AppleScript, `osascript`, JXA, System Events, shell commands, or any
+  other UI-automation technology unless the user explicitly asks for that
+  technology.
+- Main agent only. Never delegate Computer Use to a subagent.
 
-Observe once, act once, then verify.
+## Bootstrap every call
 
-1. If readiness is unknown, call `request_access` once.
-2. `list_apps` shows running apps only. If the user names an app that is absent,
-   use `open_application` once with the original user-provided name: copy it character-for-character,
-   including its script, case, spaces, punctuation, and suffixes such as `app`.
-   For example, use `{"name":"网易云音乐app"}`, not `{"name":"网易云音乐"}`;
-   use `{"name":"日历"}`, not `{"name":"Calendar"}`.
-   Do not translate, localize, normalize, shorten, or remove a suffix. Do not retry names,
-   operate Finder/Spotlight, use shell commands to discover it, or substitute a different running app.
-3. Call `get_app_state`. Start with the accessibility tree and no screenshot.
-4. If the target has an accessibility element, use an element action. This is the primary path because it is semantic, precise, background-safe, and does not steal the user's focus.
-5. Only when accessibility cannot locate or express the target, request a window
-   screenshot or full screenshot and use a frame-bound coordinate action.
-6. Let actions return the default receipt only. Use `return_state="compact"` or
-   call `get_app_state` only when the next step needs fresh UI state.
+Each `mcp__node_repl__js` call runs in a fresh Worker. Globals, imports, module
+cache and any binding are gone by the next call, so `const app` does not survive
+the end of the cell. The UI state does survive, so re-binding in the next cell is
+cheap.
 
-Do not run both the accessibility and visual workflows for the same action.
-Do not activate or focus an app merely to make a semantic action work.
-Honor tool capabilities and fail-closed results.
+Put the bootstrap and the actions in the **same** cell, bootstrap first:
 
-Tool failures are reported without a producer-side permission classifier. Read
-the original message before choosing recovery. Call `request_access` once only
-when the failure explicitly names Accessibility or Screen Recording; do not
-infer macOS permission loss from a generic `permission_denied`, foreground,
-focus-policy, UIPI, or capability failure. If delivery is `possibly_sent`,
-observe the application state and never replay the same action automatically.
-If `request_access` reports Accessibility as `denied`/`stale` or Screen Recording
-as `denied`, tell the user that authorization is required and end the current
-turn. Do not call another Computer Use action, retry `request_access`, or promise
-that the interrupted action will continue automatically after authorization.
+```js
+const root =
+  process.env.ZCODE_CUA_PLUGIN_ROOT ??
+  process.env.ZCODE_PLUGIN_ROOT ??
+  process.env.CLAUDE_PLUGIN_ROOT;
+const { join } = await import("node:path");
+const { pathToFileURL } = await import("node:url");
+const { setupComputerUseRuntime } = await import(
+  pathToFileURL(join(root, "scripts", "computer-use-client.mjs")).href,
+);
+await setupComputerUseRuntime({ globals: globalThis });
+```
 
-## Choose the target
+## Accessibility first
 
-There are two authoritative target forms:
+Accessibility is the primary action path. It is semantic, precise, works on a
+background app and does not steal the user's focus.
 
-- Element: `{"type":"element","state_id":"<state_id>","index":<index>}`
-- Coordinate: `{"type":"coordinate","x":<x>,"y":<y>}`
+1. Observe, then search the returned tree for the target by its role, name,
+   title, value or other visible identity.
+2. When a matching element exists, act on it by **index**. For a control that
+   advertises a semantic action, `performSecondaryAction` is also correct.
+3. For a settable element prefer `setValue` over typing or pasting. Reach for
+   `paste` only when the target is not settable or the content is rich text.
+4. Keyboard input is the fallback: use `pressKey` only when no element expresses
+   the operation, or the user asked for keyboard interaction. Coordinates are the
+   last fallback, for canvas, games and Electron content accessibility cannot see.
 
-Use an element target whenever the observed accessibility tree contains the
-target. Use only an action advertised by the element.
-Never translate image pixels into an element target.
+Do not replace an available element action with a keyboard shortcut just because
+the shortcut is shorter. Do not run both the accessibility and visual paths for
+the same action.
 
-Use a coordinate target only for a point chosen from the latest returned image.
-Submit only `x` and `y`. Do not attach an `app_ref`, `state_id`, coordinate-space
-name, or extra transform to it. An optional explicit `frame_id` exists only for
-backward compatibility; never invent one.
+**Observation works on a background app, screenshots included** — on any
+display, including windows at negative coordinates.
+`has_image: false` means the call did not ask for pixels (`getAXState`), never
+that capture failed.
 
-### Frame-bound coordinates
+Success means the API accepted an action, not that the app acted. Typing into a
+web-content editor can be accepted and change nothing, so re-observe to confirm
+the text landed.
 
-Choose `x` and `y` only by looking at the current returned raster.
-Submit those integers unchanged; CUA binds the current raster internally.
-CUA owns every transform from the returned raster to native dispatch.
+## API
 
-When visual fallback begins, discard coordinate-like numbers from earlier text or accessibility results.
-They are not part of the visual task.
+```typescript
+type Vec2 = [x: number, y: number];
+type ObservationOptions = { emit?: boolean };
+type StateOptions = ObservationOptions & { disableDiffing?: boolean };
+type StateAndScreenshot = { state: string; screenshot?: Uint8Array };
+type Direction = "up" | "down" | "left" | "right" | "u" | "d" | "l" | "r";
+type MouseButton = "left" | "right" | "middle" | "l" | "r" | "m";
+type SelectionType = "text" | "cursor_before" | "cursor_after";
+type Strategy = "auto" | "a11y" | "event";
 
-Act directly on the current raster when the target is clear.
-Do not call `zoom` routinely.
-Zoom is not part of the normal flow.
-Use `zoom` only when the target is too small or ambiguous to select confidently.
-For a Zoom result, choose the point in that returned child raster and submit only its pixels.
+type ClickOptions = {
+  mouseButton?: MouseButton;
+  clickCount?: number;
+  modifiers?: string;
+  strategy?: Strategy;
+};
+type SelectTextOptions = { prefix?: string; suffix?: string; selectionType?: SelectionType };
+type PasteOptions = { format?: "text" | "md" | "html" };
+type PressKeyOptions = { holdSeconds?: number; strategy?: Strategy };
 
-## Action strategy
+interface Target {
+  getAXState(options?: StateOptions): Promise<string>;
+  getScreenshot(options?: ObservationOptions): Promise<Uint8Array>;
+  getAXStateAndScreenshot(options?: StateOptions): Promise<StateAndScreenshot>;
+  elements(): Promise<{ index: number; kind: string; title: string | null; value: string | null; actions: string[] }[]>;
 
-- Accessibility element action is always preferred. It avoids focus changes and
-  real-pointer movement.
-- `strategy="a11y"` requires an accessibility action and fails closed otherwise.
-- For a coordinate target, `strategy="auto"` may use an actionable accessibility
-  hit first and otherwise follows the tool's declared fallback behavior.
-- `strategy="event"` forces the raw coordinate path on tools that expose it. Use
-  it only when accessibility cannot perform the intended action or the task
-  explicitly requires visual pixel interaction.
+  paste(text: string, options?: PasteOptions): Promise<void>;
+  click(target: number | Vec2, options?: ClickOptions): Promise<void>;
+  drag(from: number | Vec2, to: number | Vec2, options?: { modifiers?: string }): Promise<void>;
+  pressKey(key: string, options?: PressKeyOptions): Promise<void>;
+  scroll(target: number | Vec2, direction: Direction, pages?: number): Promise<void>;
+  selectText(elementIndex: number, text: string, options?: SelectTextOptions): Promise<void>;
+  setValue(elementIndex: number, value: string): Promise<void>;
+  typeText(text: string): Promise<void>;
+  performSecondaryAction(elementIndex: number, action: string): Promise<void>;
+}
 
-On macOS, verified app/window-scoped raw dispatch is designed not to move the
-real cursor or steal focus. Linux and Windows may require the target window to
-be foreground for raw input. Never bypass a stale-frame, changed-owner,
-occlusion, permission, or capability refusal.
+interface App extends Target {}
 
-A coordinate refusal may report that windows covering the point were skipped, or
-name an owner other than the app you expected. Those windows are invisible
-overlays belonging to the user's environment. Raise the window you meant to act on
-with `open_application(activate=true)`, observe again, and retry. Do not move,
-resize, or close the reported windows.
+type AppRef = { name?: string; bundle_id?: string; pid?: number; window_id?: number };
+type AppInfo = { pid: number; name: string | null; bundle_id: string | null; active: boolean };
+type State = { apps: AppInfo[] };
 
-### macOS file panels
+declare const agent: {
+  computerUse: {
+    getState(options?: ObservationOptions): Promise<State>;
+    getApp(target: string | AppRef): Promise<App>;
+    listApps(options?: ObservationOptions): Promise<AppInfo[]>;
+    computer: Record<string, (args: object) => Promise<unknown>>;
 
-For an `open_panel` / `save_panel` exact-path workflow, background app-scoped
-keyboard receipts may be accepted without executing the AppKit command. Use this
-single recovery sequence:
+    requestAccess(capabilities?: string[]): Promise<Record<string, unknown>>;
+    stop(reason?: string): Promise<void>;
+  };
+};
+```
 
-1. Observe the panel and keep its `pid`, `bundle_id`, and fresh `actual_window_id`.
-2. Call `open_application` with those three fields and `activate=true`.
-3. Observe the same panel again, then send Cmd+Shift+G with `strategy=event` and
-   that exact panel window id.
-4. Observe by `pid` / `bundle_id` **without the old panel `window_id`**, so CUA
-   returns the newly focused `attached_dialog`. Pin its fresh `actual_window_id`
-   for the path `type(strategy=event)` and Enter.
+The full reference is `agent.documentation.get("computer-use")`, fetched on demand;
+read it only for an argument shape or response field this page does not give.
 
-`key` and `type` never activate implicitly. If they return `foreground_required`
-with `action_sent=false`, repeat the confirmed activation and fresh observation;
-do not retry the same key blindly. Ordinary windows and popovers do not receive
-this activation exception.
+## The loop
 
-For every ordinary launch or application activation, omit `window_id`. Never
-invent a window id or use a placeholder such as `1`. If `bundle_id` or `pid` is
-known, pass that canonical identity without a translated or guessed `name`.
+Observe once, act, then observe again before deciding the next step.
 
-## Text and keyboard
+`agent.computerUse.getApp(...)` binds an app and shows nothing; call `getAXState`
+when you need to see its state. Binding also launches it if not running; there is
+no separate launch tool. Its argument is a display name or a bundle identifier —
+the same strings `listApps()` returns — or an `AppRef`.
 
-Prefer `set_value` for editable elements. It is semantic and background-safe.
-Use `select_text` and `perform_action` for element capabilities exposed by the
-current state.
+When the user names an application, copy it character-for-character into the app
+identifier. Do not translate, localize, normalize, shorten, or remove a suffix:
+`{"name":"网易云音乐app"}` is not `{"name":"网易云音乐"}`; `{"name":"日历"}` is not
+`{"name":"Calendar"}`. A rewritten name resolves to a different app or to nothing,
+and the failure reads "app not found". If the exact string does not resolve, call
+`agent.computerUse.listApps()` once and pick the matching identifier.
 
-Never send targetless `type` or `key`; scope them with an element target or
-`app_ref` as allowed by the tool schema. Preserve a returned `window_id` in
-`app_ref` so the runtime can verify and retain window scope.
-macOS uses `cmd`; Linux and Windows use `ctrl`.
-Use `hold_key` for a duration; use `key` for a normal chord or repeated presses.
+Batch related actions and a single closing observation into one cell:
 
-Platform app references:
+```js
+const app = await agent.computerUse.getApp("Notes");
+await app.click(box);
+await app.typeText("hello");
+await app.pressKey("Return");
+await app.getAXState();
+```
 
-- macOS: prefer `bundle_id`, otherwise `pid`.
-- Windows: use AUMID in `bundle_id` for packaged apps; otherwise `name` or `pid`.
-- Linux: use `name` or `pid`; do not invent a bundle id.
+An element index addresses that app's latest observation, so several actions may
+reuse one index without re-observing between them — click an index, then type into
+it, in the same cell. Observing renumbers the tree, so take indices from the newest
+one. A vanished element fails closed with `ELEMENT_UNAVAILABLE`.
 
-## Outcome and retry safety
+The tree comes back as a diff only against a tree this cell already showed you,
+listing the elements that were removed, added or changed; unchanged rows are
+omitted and their indices stay valid. The first tree after binding, and the first
+after `getScreenshot` or `elements()`, are always complete. Pass
+`{ disableDiffing: true }` for a full tree at any point. If a standalone
+observation reports no change, do not immediately repeat it without an
+intervening action.
 
-`action_sent=true` means the action may already have happened. Never blindly
-replay it. When `action_sent=false`, re-observe with `get_app_state`, choose a
-fresh target from the new state, and issue a new action only if it is still
-needed. Never replay the same stale action call.
+A large tree is trimmed by priority (ancestors kept), the header says so, and
+indices then skip numbers. `app.elements()` returns every element with its index,
+trimmed ones included — filter it in JS, never guess an index.
 
-The default action result is an `action_receipt`, not a UI observation. Old
-`state_id` values used by a sent element write are consumed after dispatch; call
-`get_app_state` before another element write or whenever the next step depends
-on current UI state. A changed tree is not by itself proof that this action
-caused the change; verify with the app state or an external task oracle when it
-matters.
+A capture is scoped to one window: without a `window_id` the main/key window is
+re-resolved every observation, so a modal that just opened becomes the captured
+window. When an action fails or the tree reads like another part of the app, check
+the observation's `window` — a dialog shows up there. Read it, then act on it, or
+dismiss it (Escape or its own cancel) and observe again. A missing element is not
+proof the action worked. Pin one with `getApp({pid, window_id})`; `list_windows`
+has the id.
 
-Call `stop_computer_control` to stop the active control session. Do not continue
-after the kill switch, denied access, or a non-retryable readiness result.
+## Output
+
+Observations display themselves: `getAXState`, `getScreenshot`,
+`getAXStateAndScreenshot`, `getState` and `listApps` emit their own result.
+Never pass their return value to `nodeRepl.write(...)` or
+`nodeRepl.emitImage(...)`: a second raster in one result breaks the one-raster
+rule and the frame is removed entirely, so you end up with no picture at all.
+Pass `{ emit: false }` to suppress the display and still receive the value.
+
+Action methods display nothing.
+
+## Coordinates
+
+Choose `x` and `y` only by looking at the current returned raster, with
+`0 <= x < width` and `0 <= y < height` for that raster. Submit those integers
+unchanged; CUA binds the current raster internally and owns every transform from
+the returned raster to native dispatch. Element and window bounds are diagnostic
+global screen points and must never be copied into a coordinate. When visual
+fallback begins, discard coordinate-like numbers from earlier text or
+accessibility results.
+
+Act on the current raster when the target is clear; if it is too small or ambiguous,
+re-observe rather than guessing at geometry.
+
+A pointer action accepted with no change usually means the app acted where the real
+pointer sits: repeating it will not help — use an element index or the keyboard.
+
+A coordinate refusal may name an unexpected owner, or say the frame is stale — the
+window moved, resized or was replaced. Observe again for a current raster, or act on
+an element index, which does not depend on window geometry. Never move, resize or
+close a window to make a coordinate land.
+
+## Keyboard
+
+`pressKey` takes a key or a `+`-separated chord and accepts both short names and
+X keysym style: `"a"`, `"Return"`, `"Tab"`, `"Control_L+a"`, `"super+c"`, `"Up"`.
+macOS uses `cmd`; Linux and Windows use `ctrl`. Use `{ holdSeconds }` to hold a
+key or chord for a duration rather than simulating repeated presses.
+
+Bind keyboard input to an app or element; never send it unbound. `paste` is for
+rich text, or a target `setValue` cannot set — not for plain text a settable
+element accepts.
+
+`performSecondaryAction` accepts only an action the element advertises in the
+current tree. Do not guess an action name.
+
+At most one element is `focused` — the one holding keyboard focus; absent means
+undetermined.
+
+`selectText` locates text inside an editable element. Use `prefix`/`suffix` to
+disambiguate repeated matches and `selectionType` to place the cursor instead of
+selecting. An ambiguous match is refused rather than resolved to the first hit.
+
+## Waiting
+
+Observations wait for the UI to settle before capturing. Do not pause or delay
+before reading state — no `setTimeout`, no polling loop.
+
+## Errors and stopping
+
+Actions resolve to `undefined` on success and throw `ComputerUseError` otherwise:
+
+- `code` — `PERMISSION_DENIED`, `NOT_AUTHORIZED`, `APP_NOT_FOUND`,
+  `AMBIGUOUS_APP`, `LAUNCH_FAILED`, `INVALID_APP`, `ELEMENT_UNAVAILABLE`,
+  `STALE_STATE`, `NOT_SETTABLE`, `NOT_SELECTABLE`, `ACTION_UNAVAILABLE`,
+  `FOREGROUND_REQUIRED`, `CONTROLLER_BUSY`, `CONTROL_STOPPED`, `SCREEN_LOCKED`,
+  `HELPER_UNAVAILABLE`, `VERSION_MISMATCH`, `TIMEOUT`,
+  `STRUCTURED_STATE_UNAVAILABLE`, `INTERNAL`.
+- `actionSent` — whether the action may already have reached the app. Retry a
+  non-idempotent action only when this is `false`; otherwise observe first and
+  decide from what you see.
+- `retry` — `"reobserve"`, `"retry"` or `"never"`.
+
+`CONTROLLER_BUSY` means another live ZCode Computer Use session owns input. It is
+never retryable: report the owner from the error and ask the user to close that
+session.
+
+Stop immediately after `agent.computerUse.stop()`, a kill switch, a permission
+refusal, or a non-retryable error. Do not switch to a different UI-automation
+technology after an access refusal.
+
+Persist until the request is actually complete. Attempting an action is not
+completion: verify the returned state visibly shows the result. If it is unchanged
+or only intermediate, try another approach. Respond only when the requested state
+is visibly present, or explain a concrete blocker you cannot resolve.
 
 ## Tool surface
 
-Tool schemas are authoritative for arguments and supported strategies. The 30
-tools are grouped as follows:
+`agent.computerUse.computer.<tool>(args)` is the low-level surface. Prefer the
+bound-object API above; reach for a tool only for what the API does not
+express — window enumeration, key repeat, or reading state back in the same
+call. Arguments are strict: an undeclared key is refused. Each tool takes **one**
+arguments object — the names below are its keys, not positional parameters:
+`get_app_state({ app_ref: { bundle_id: "com.apple.Notes" }, include_screenshot: true })`.
 
-- Observe and resolve: `list_apps`, `open_application`, `list_windows`,
-  `get_app_state`, `screenshot`, `zoom`, `list_displays`, `switch_display`,
-  `cursor_position`
-- Pointer: `left_click`, `double_click`, `triple_click`, `right_click`,
-  `middle_click`, `scroll`, `left_click_drag`, `mouse_move`, `left_mouse_down`,
-  `left_mouse_up`
-- Text and keyboard: `type`, `set_value`, `select_text`, `key`, `hold_key`
-- Semantic: `perform_action`
-- Runtime: `request_access`, `stop_computer_control`, `wait`, `read_clipboard`,
-  `write_clipboard`
+Name an app as the OS lists it (Windows: the Start-menu name, not a window title).
+Nothing takes the user's focus, except on Windows: launching a non-packaged app
+does, and `include_screenshot=true` un-minimizes — a minimized tree is fully
+usable, so keep the default.
 
-Do not infer unsupported arguments from this guide. Read the live tool schema,
-prefer the accessibility path, and use screenshot pixels only as the fallback.
+```
+list_apps({})
+list_windows({app_ref})
+get_app_state({app_ref, include_screenshot?=false, disable_diffing?=false})
+
+left_click({target, mouse_button?="left", click_count?=1, modifiers?="",
+           strategy?, app_ref?, return_state?})
+left_click_drag({from_target, to, modifiers?="", app_ref?, return_state?})
+scroll({target, scroll_direction, scroll_amount, strategy?, app_ref?,
+       return_state?})
+
+type({text, target?, app_ref?, strategy?, return_state?})
+set_value({target, value, strategy?, app_ref?, return_state?})
+select_text({target, text_range?, app_ref?, return_state?})
+key({text, repeat?, hold_seconds?, app_ref?, strategy?, return_state?})
+paste({text, format?="text", app_ref?, return_state?})
+perform_action({target, action, app_ref?, return_state?})
+
+request_access({capabilities?})
+stop_computer_control({reason?})
+```
+
+Argument shapes: `app_ref` / `app` is an `AppRef`, but a bare string here is
+read as a bundle id, so pass `{name: "Notes"}` for a display name.
+`scroll_direction` is `up|down|left|right`, `scroll_amount` is pages, `strategy`
+is `auto|a11y|event`, and `return_state` is `compact|full|none` to return the app
+state in the same call. For `target`, `text_range`, `modifiers` and the response
+shapes, see `nodeRepl.write(await agent.documentation.get("computer-use"))`.

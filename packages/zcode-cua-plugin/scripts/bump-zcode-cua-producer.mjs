@@ -27,6 +27,8 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { resolvePnpmInvocation } from "./resolve-pnpm-invocation.mjs";
+
 const execFile = promisify(execFileCallback);
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = resolve(packageRoot, "../../../..");
@@ -183,8 +185,20 @@ await writeFile(workspacePath, workspaceText);
 
 // 4) 更新 lockfile 与 node_modules（coherence 写回要读 installed producer 契约）。
 console.log("[cua-bump] 运行 pnpm install（更新 lockfile 与 installed producer）…");
-await runOrThrow("pnpm install", "pnpm", ["install", "--prefer-offline"], {
+// Bug 原因（2026-09-14）：这里原来直接 execFile("pnpm", ...)，Windows 上必然
+// `spawn pnpm ENOENT`——pnpm 装出来是 `pnpm.cmd`，execFile 不走 shell 时不补 PATHEXT。
+// 换成 `pnpm.cmd` 又变成 `spawn EINVAL`：Node 自 18.20/20.12 起（CVE-2024-27980）禁止
+// 不带 shell spawn `.cmd`/`.bat`。也就是说这条原子 bump 在 Windows 上从来没跑通过，而
+// 手改 producer SHA 会被 CI 第一站 check-cua-baseline.mjs 拒绝——等于 Windows 上没有
+// 可用的升 pin 路径。决策抽到 resolve-pnpm-invocation.mjs 才能被单测覆盖：本脚本是
+// top-level await，import 它就会真的执行一次 bump。
+const pnpmInvocation = resolvePnpmInvocation({
+  npmExecpath: process.env.npm_execpath,
+  platform: process.platform,
+});
+await runOrThrow("pnpm install", pnpmInvocation.command, pnpmInvocation.args, {
   cwd: repoRoot,
+  ...pnpmInvocation.options,
 });
 
 // 5) 写 bundled Skill 与 upstream.json provenance。
