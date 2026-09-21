@@ -47,7 +47,7 @@ export const desktopRendererDependencyAliases = {
 } as const;
 
 function resolveZCodeEnv(value: string | undefined): "test" | "production" {
-  return value?.trim().toLowerCase() === "production" ? "production" : "test";
+  return value?.trim().toLowerCase() === "test" ? "test" : "production";
 }
 
 function createE2EUIRendererCoveragePlugin(repoRoot: string): Plugin {
