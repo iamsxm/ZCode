@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@zcode/zcode-cua-plugin",
+  "version": "0.5.14",
+  "private": true,
+  "description": "ZCode CUA plugin wrapper; its version tracks the upstream zcode-cua MCP server version (enforced by check-version-coherence.mjs against the pnpm catalog pin)",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/mcp/server.js",
+  "types": "./src/mcp/server.ts",
+  "scripts": {
+    "build": "tsc --noEmit && node scripts/build-mcp.mjs",
+    "clean": "node ../../scripts/clean-dist.mjs",
+    "sync:skill": "node scripts/sync-skill-from-zcode-cua.mjs",
+    "bump:producer": "node scripts/bump-zcode-cua-producer.mjs",
+    "check:baseline": "node scripts/check-cua-baseline.mjs",
+    "sync:cache": "node scripts/sync-cache.mjs",
+    "version:check": "node scripts/check-version-coherence.mjs --check",
+    "sync:version": "node scripts/check-version-coherence.mjs",
+    "sync:all": "pnpm sync:skill && pnpm sync:version && pnpm build && pnpm sync:cache",
+    "test": "pnpm run build && node --import tsx --test tests/*.node-test.mjs && pnpm --filter @zcode/cli... build && pnpm --dir ../cli exec node --import tsx --test tests/zcode-cua-plugin-host-authority.node-test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@zcode/zcode-cua": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}

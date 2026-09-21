@@ -72,8 +72,6 @@ export const OFFICIAL_BROWSER_USE_REQUIRED_SEED_PATHS = [
 ] as const;
 
 const OFFICIAL_CUA_REQUIRED_SEED_PATHS = [
-  "docs/computer-use.md",
-  "scripts/computer-use-client.mjs",
   "skills/computer-use/SKILL.md",
 ] as const;
 
@@ -359,7 +357,7 @@ export const OFFICIAL_PLUGIN_DEFINITIONS: readonly OfficialPluginDefinition[] = 
     runtimeTopLevelPaths: [],
     // 这里的 version 追踪上游 zcode-cua runtime 版本，使插件 UI 展示、缓存路径、
     // marketplace 条目都对齐；具体版本由原子 producer bump 工作流维护。
-    version: "0.6.3",
+    version: "0.5.14",
   },
 ];
 

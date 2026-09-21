@@ -1,0 +1,19 @@
+{
+  "name": "computer-use",
+  "version": "0.5.14",
+  "description": "Computer Use: automate desktop apps with mouse, keyboard, and UI element control.",
+  "author": {
+    "name": "Z.ai"
+  },
+  "license": "MIT",
+  "skills": "skills",
+  "mcpServers": {
+    "computer-use": {
+      "command": "node",
+      "timeoutMs": 90000,
+      "args": [
+        "${ZCODE_PLUGIN_ROOT}/dist/mcp/server.js"
+      ]
+    }
+  }
+}
