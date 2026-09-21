@@ -80,11 +80,12 @@ function resolveCommitId() {
 }
 
 export function collectBuildMetadata() {
+  const envVersion = process.env.ZCODE_APP_VERSION?.trim();
   const rootPackageJson = readJson(resolve(workspaceDir, "package.json"));
   const desktopPackageJson = readJson(resolve(desktopDir, "package.json"));
 
   return {
-    appVersion: normalizeVersion(rootPackageJson.version),
+    appVersion: normalizeVersion(envVersion || rootPackageJson.version),
     buildCommitId: resolveCommitId(),
     buildTime: new Date().toISOString(),
     electronBuilderVersion: resolveInstalledPackageVersion(
