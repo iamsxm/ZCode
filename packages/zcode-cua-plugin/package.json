@@ -21,7 +21,7 @@
     "typecheck": "node scripts/check-sdk.mjs"
   },
   "dependencies": {
-    "@zcode/zcode-cua": "catalog:"
+    "@zcode/zcode-cua": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
