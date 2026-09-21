@@ -134,7 +134,6 @@ export function PluginStoreDetailView({
             <h1 className="min-w-0 truncate text-2xl font-semibold tracking-tight text-foreground">
               {displayName}
             </h1>
-            <PluginStorePaidPlanBadge item={item} />
           </div>
           <div className="flex shrink-0 items-center gap-1.5">
             {item.installed ? (

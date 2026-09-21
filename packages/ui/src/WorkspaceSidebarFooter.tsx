@@ -37,9 +37,12 @@ import {
   ZoomOut,
 } from "lucide-react";
 import { usePlatform } from "@/hooks/usePlatform.js";
+import { useProviderSettingsView } from "@/hooks/useProviderSettingsView.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useShortcutCommandLabel } from "@/shortcuts/useShortcutBindings.js";
 import { useZCodeStore } from "@/store/StoreProvider.js";
+import { selectWorkspaceZCodeState, useZCodeSessionStore } from "@/store/zcodeSessionStore.js";
+import { parseCustomProviderIdFromSupplierKey } from "@/lib/modelConfigSync.js";
 import { normalizeInterfaceMode } from "@/lib/interfaceMode.js";
 import type { Theme } from "@/useTheme.js";
 import {
@@ -51,33 +54,59 @@ import {
 const DESKTOP_ZOOM_MIN_LEVEL = -3;
 const DESKTOP_ZOOM_MAX_LEVEL = 5;
 
-function getSidebarProfileName(user?: UserInfo | null): string {
-  const displayName = user?.displayName?.trim();
-  if (displayName) {
-    return displayName;
+function resolveSidebarCustomProviderBadge({
+  providerSettingsRead,
+  selectedSupplierKey,
+}: {
+  providerSettingsRead: ReturnType<typeof useProviderSettingsView>;
+  selectedSupplierKey: string;
+}): string {
+  const view =
+    providerSettingsRead.state.status === "ready" ? providerSettingsRead.state.view : null;
+  if (!view) {
+    return "ZCode";
   }
 
-  const username = user?.username?.trim();
-  if (username) {
-    return username;
+  const customProviders = view.providers.filter(
+    (provider) => provider.effectiveConfig.group === "standard-personal",
+  );
+
+  const selectedProviderId = parseCustomProviderIdFromSupplierKey(selectedSupplierKey);
+  if (selectedProviderId) {
+    const matched = customProviders.find((p) => p.providerId === selectedProviderId);
+    if (matched?.providerName?.trim()) {
+      return matched.providerName.trim();
+    }
+  }
+
+  if (customProviders[0]?.providerName?.trim()) {
+    return customProviders[0].providerName.trim();
   }
 
   return "ZCode";
 }
 
-function getSidebarProfileBadge(
-  user: UserInfo | null | undefined,
-  formatMessage: ReturnType<typeof useZCodeIntl>["intl"]["formatMessage"],
-): string {
-  if (user) {
-    return getSidebarProfileName(user);
+function getSidebarProfileBadge({
+  user,
+  customProviderName,
+}: {
+  user: UserInfo | null | undefined;
+  customProviderName: string;
+}): string {
+  const displayName = user?.displayName?.trim() || user?.username?.trim();
+  if (displayName) {
+    return displayName;
   }
 
-  return formatMessage({ id: "sidebar.profile.notLoggedIn" });
+  // 移除“连接使用”文字，默认使用模型的自定义供应商名称
+  return customProviderName || "ZCode";
 }
 
-function getAvatarFallbackText(user: UserInfo | null | undefined): string {
-  const source = user?.displayName?.trim() || user?.username?.trim() || "Z";
+function getAvatarFallbackText(
+  user: UserInfo | null | undefined,
+  fallbackText: string,
+): string {
+  const source = user?.displayName?.trim() || user?.username?.trim() || fallbackText || "Z";
   return source[0]?.toUpperCase() ?? "Z";
 }
 
@@ -128,8 +157,21 @@ export const WorkspaceSidebarFooter = memo(function WorkspaceSidebarFooterCompon
   const zoomOutShortcutLabel = useShortcutCommandLabel("zoomOut");
   const resetZoomShortcutLabel = useShortcutCommandLabel("resetZoom");
   const isRestoringOAuthSession = useZCodeStore((state) => state.isRestoringOAuthSession);
-  const profileBadge = getSidebarProfileBadge(user, intl.formatMessage);
-  const avatarFallbackText = getAvatarFallbackText(user);
+  const providerSettingsRead = useProviderSettingsView();
+  const selectedSupplierKey = useZCodeSessionStore((state) =>
+    workspacePath
+      ? selectWorkspaceZCodeState(state, workspacePath, workspaceIdentity).selectedSupplierKey
+      : "",
+  );
+  const customProviderName = resolveSidebarCustomProviderBadge({
+    providerSettingsRead,
+    selectedSupplierKey,
+  });
+  const profileBadge = getSidebarProfileBadge({
+    user,
+    customProviderName,
+  });
+  const avatarFallbackText = getAvatarFallbackText(user, customProviderName);
   const avatarKey = user?.avatarUrl ?? user?.id ?? "guest";
   const showAuthRestoreLoading = !user && isRestoringOAuthSession;
   const usageSummaryState = useWorkspaceSidebarFooterUsageSummaryState({
