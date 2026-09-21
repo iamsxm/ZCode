@@ -29,10 +29,6 @@ jobs:
             platform: mac
             arch: arm64
             name: macOS-AppleSilicon
-          - os: macos-13
-            platform: mac
-            arch: x64
-            name: macOS-Intel
           - os: ubuntu-22.04
             platform: linux
             arch: x64
