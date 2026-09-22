@@ -1,9 +1,10 @@
 # @zcode/zcode-cua
 
-API-compatible placeholder package for Computer Use. This build ships without
-Computer Use: every runtime surface (Computer Use runtime, broker RPC, Helper
-install/launch/verify, PiP session client, native addon loader) reports
-**unavailable** and fails closed, predicates about official CUA frames are
-`false`, and permission ports keep their privacy fail-closed semantics.
+Computer Use protocol and runtime adapter used by the desktop product. The
+native Helper remains an installation artifact under
+`resources/tools/cua-helper`; this package connects to its authenticated NDJSON
+broker and fails closed when the broker is not supplied. Helper installation,
+native addon loading, and platform permissions remain owned by the desktop
+host.
 
 License: Apache-2.0.

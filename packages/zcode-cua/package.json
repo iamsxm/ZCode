@@ -2,7 +2,7 @@
   "name": "@zcode/zcode-cua",
   "version": "0.6.3",
   "private": true,
-  "description": "API-compatible placeholder package for Computer Use. This build ships without Computer Use: every runtime surface reports unavailable and fails closed.",
+  "description": "Computer Use broker client and host contracts; the product Helper is supplied by the desktop installation.",
   "license": "Apache-2.0",
   "type": "module",
   "exports": {
