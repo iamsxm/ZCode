@@ -26,10 +26,11 @@ if (process.platform !== "win32") {
 }
 
 if (!source || !existsSync(source)) {
-  throw new Error(
-    `[prepare-cua-helper-runtime] source runtime not found: ${source || "<unset>"}. ` +
-      "Set ZCODE_CUA_HELPER_SOURCE to an installed cua-helper directory.",
+  console.log(
+    `[prepare-cua-helper-runtime] skip: source runtime not found at ${source || "<unset>"}. ` +
+      "Optional for CI and environments without local installed official ZCode.",
   );
+  process.exit(0);
 }
 
 const manifestPath = join(source, "runtime-manifest.json");

@@ -623,13 +623,17 @@ export default {
             from: "build/icon.ico",
             to: "tray_icon.ico",
           },
-          {
-            // 本地学习/构建版 Computer Use runtime：由 prepare:cua-helper 从已安装 Helper
-            // staging 到 dist-cua-helper，正式包统一放入 resources/tools/cua-helper。
-            from: "dist-cua-helper",
-            to: "tools/cua-helper",
-            filter: ["**/*"],
-          },
+          ...(existsSync(resolve(desktopPackageRoot, "dist-cua-helper"))
+            ? [
+                {
+                  // 本地学习/构建版 Computer Use runtime：由 prepare:cua-helper 从已安装 Helper
+                  // staging 到 dist-cua-helper，正式包统一放入 resources/tools/cua-helper。
+                  from: "dist-cua-helper",
+                  to: "tools/cua-helper",
+                  filter: ["**/*"],
+                },
+              ]
+            : []),
         ]
       : []),
     {

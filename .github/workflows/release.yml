@@ -89,6 +89,7 @@ jobs:
           ZCODE_SKIP_REMOTE_ASSETS: '1'
           ELECTRON_MIRROR: https://npmmirror.com/mirrors/electron/
           ELECTRON_BUILDER_BINARIES_MIRROR: https://registry.npmmirror.com/-/binary/electron-builder-binaries/
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: pnpm bundle:desktop -- --os ${{ matrix.platform }} --arch ${{ matrix.arch }}
 
       - name: Organize build artifacts
