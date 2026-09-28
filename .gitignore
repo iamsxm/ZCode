@@ -11,6 +11,7 @@ mock-cdn/
 packages/desktop/bundled-resources/
 packages/desktop/bundled-agents/
 packages/desktop/bundled-tools/
+packages/desktop/dist-cua-helper/
 packages/desktop/mock-cdn/
 *.tsbuildinfo
 .DS_Store
@@ -69,3 +70,4 @@ packages/desktop/.e2e-artifacts/
 packages/desktop/.e2e-cache/
 packages/desktop/.e2e-network-capture/
 .zcode-runtime/
+vibe_images/

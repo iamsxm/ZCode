@@ -11,6 +11,7 @@
 - 增加认证、请求 ID 校验、响应解析、超时、断线、非法 JSON 和 broker 错误的 fail-closed 处理。
 - `createComputerUseRuntime()` 将 node_repl 的工具调用转发为官方 Helper 方法，并保留 MCP `content` 与结构化结果。
 - Desktop Windows 运行时继续从安装目录的 `resources/tools/cua-helper` 解析 Helper manifest、脚本入口和 native addon；官方 Helper 文件未复制进开源仓库。
+- 源码构建新增 `prepare:cua-helper`：Windows 开发机可从 `ZCODE_CUA_HELPER_SOURCE` 或默认官方安装路径 staging Helper，`pnpm dev:desktop` 会自动设置 `ZCODE_CUA_DEV_ROOT`；Windows 打包会将 staging 目录放入 `resources/tools/cua-helper`。
 - 已验证：官方 Helper 启动、`authenticate`、`broker_info`、`controller_status`、`permission_status`、`list_applications` 以及 runtime wrapper 的真实调用。
 
 ### 已知限制

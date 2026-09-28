@@ -3,9 +3,10 @@
 ## Scope
 
 Restore the Windows Computer Use broker client needed by the existing
-`node_repl` host. The first milestone is a read-only broker round trip to the
-official Helper; native actions remain fail-closed until their request and
-permission contracts are verified.
+`node_repl` host, and make the official Helper runtime available to source
+builds through an explicit local staging step. The native Helper remains an
+external runtime artifact; the open-source build owns its discovery, manifest
+validation, lifecycle and broker connection.
 
 ## Ownership and event order
 
@@ -42,3 +43,16 @@ timeout remains unavailable and must not fall back to local automation.
 3. Given an absent broker path, `createComputerUseRuntime` remains unavailable
    and the existing node_repl error is preserved.
 4. Given an abort signal, the socket is destroyed and the promise settles.
+
+## Source-build runtime staging
+
+- On Windows, `pnpm --filter @zcode/desktop prepare:cua-helper` stages the
+  runtime into `packages/desktop/dist-cua-helper`.
+- `ZCODE_CUA_HELPER_SOURCE` may point to another local Helper runtime; when it
+  is absent, the script uses the standard installed ZCode path under
+  `%LOCALAPPDATA%/Programs/ZCode/resources/tools/cua-helper`.
+- The staged package name is normalized to `@zcode/zcode-cua` because the
+  runtime resolver validates the producer contract name. The native files and
+  manifest hashes are copied unchanged.
+- `pnpm dev:desktop` sets `ZCODE_CUA_DEV_ROOT` to the staged directory. Windows
+  production packaging copies that directory to `resources/tools/cua-helper`.

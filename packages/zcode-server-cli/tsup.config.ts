@@ -30,6 +30,7 @@ export default defineConfig({
   noExternal: ["@zcode/shared", "@zcode/rpc", "@zcode/services"],
   define: SERVER_CLI_DEFINES,
   external: [
+    "@larksuiteoapi/node-sdk",
     "node-pty",
     "ssh2",
     "yaml",

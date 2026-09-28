@@ -633,9 +633,31 @@ export function candidateBaseDirs(): string[] {
   // 修复原因：Electron app-server 运行在 resources/glm/zcode.cjs，官方插件资源也随桌面包
   // stage 到同级 packages/*-plugin。候选目录必须优先看入口文件目录，避免生产态退回到
   // monorepo-only 的 __dirname 查找假设。
-  return [entrypointDir(), runtimeDir(), process.cwd()].filter(
+  const dirs = [entrypointDir(), runtimeDir(), process.cwd()].filter(
     (dir): dir is string => typeof dir === "string",
   );
+  for (const dir of [...dirs]) {
+    const repoRoot = findMonorepoRoot(dir);
+    if (repoRoot && !dirs.includes(repoRoot)) {
+      dirs.push(repoRoot);
+    }
+  }
+  return dirs;
+}
+
+function findMonorepoRoot(startDir: string): string | undefined {
+  let current = startDir;
+  while (true) {
+    if (
+      existsSync(join(current, "pnpm-workspace.yaml")) &&
+      existsSync(join(current, "packages", "desktop"))
+    ) {
+      return current;
+    }
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
 }
 
 function runtimeDir(): string | undefined {

@@ -58,6 +58,9 @@ try {
   // Preserve its runtime-asset preparation and stale `out` cleanup explicitly
   // before rebuilding bundles or starting Electron.
   await run(pnpmCommand, ["--filter", "@zcode/desktop", "pre-dev"]);
+  if (process.platform === "win32") {
+    process.env.ZCODE_CUA_DEV_ROOT = resolve(repoRoot, "packages/desktop/dist-cua-helper");
+  }
   // On Windows, use "node" (resolved via PATHEXT) to avoid "C:\Program Files\..." space issues
   await run(process.platform === "win32" ? "node" : process.execPath, [
     resolve(repoRoot, "scripts/build-desktop-agent-cli.mjs"),

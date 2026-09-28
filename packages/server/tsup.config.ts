@@ -28,6 +28,7 @@ function createSharedDefines() {
 }
 
 export const SERVER_HTTP_EXTERNAL_DEPENDENCIES = [
+  "@larksuiteoapi/node-sdk",
   "ssh2",
   "node-pty",
   "undici",
