@@ -23,6 +23,36 @@ export function createAppAsarPackArgs({ sourceDir, destinationPath, targetPlatfo
   ];
 }
 
+async function rmWithRetry(targetPath, options = {}) {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await rm(targetPath, { force: true, recursive: true, maxRetries: 3, retryDelay: 100, ...options });
+      return;
+    } catch (err) {
+      if ((err.code === "EBUSY" || err.code === "EPERM") && i < 9) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+async function renameWithRetry(from, to) {
+  for (let i = 0; i < 10; i++) {
+    try {
+      await rename(from, to);
+      return;
+    } catch (err) {
+      if ((err.code === "EBUSY" || err.code === "EPERM") && i < 9) {
+        await new Promise((r) => setTimeout(r, 500));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function replaceAppAsarFromStaging({
   sourceDir,
   appAsarPath,
@@ -34,8 +64,8 @@ export async function replaceAppAsarFromStaging({
   const unpackedPath = `${appAsarPath}.unpacked`;
 
   await Promise.all([
-    rm(candidateAsarPath, { force: true, recursive: true }),
-    rm(candidateUnpackedPath, { force: true, recursive: true }),
+    rmWithRetry(candidateAsarPath),
+    rmWithRetry(candidateUnpackedPath),
   ]);
 
   try {
@@ -54,14 +84,14 @@ export async function replaceAppAsarFromStaging({
     }
 
     // 先完整生成候选文件，再替换旧 archive 和 sidecar；不会把上一次打包的跨平台 native 留在 unpacked。
-    await rm(unpackedPath, { force: true, recursive: true });
-    await rename(candidateUnpackedPath, unpackedPath);
-    await rm(appAsarPath, { force: true });
-    await rename(candidateAsarPath, appAsarPath);
+    await rmWithRetry(unpackedPath);
+    await renameWithRetry(candidateUnpackedPath, unpackedPath);
+    await rmWithRetry(appAsarPath);
+    await renameWithRetry(candidateAsarPath, appAsarPath);
   } finally {
     await Promise.all([
-      rm(candidateAsarPath, { force: true, recursive: true }),
-      rm(candidateUnpackedPath, { force: true, recursive: true }),
+      rmWithRetry(candidateAsarPath),
+      rmWithRetry(candidateUnpackedPath),
     ]);
   }
 }
