@@ -24,6 +24,11 @@
 - E2E 复现：先设置 `E2E_PROVIDER_HTTP_MODE=replay`，将 `E2E_PROVIDER_REPLAY_FIXTURE_PATH` 设为 `packages/desktop/test/e2e/fixtures/upstream/common.json` 的绝对路径，再执行 `pnpm --filter @zcode/desktop test:e2e -- --spec test/e2e/manual-review/pending/help-report-vulnerability.test.ts`。默认 capture 首轮因缺少 `E2E_PROVIDER_BASE_URL` 在测试前失败，未计入通过结果。
 - 未执行全量单测、完整跨平台打包或真实 Computer Use 原生交互验证。原样合入的上游文件包含空白诊断，未全仓格式化；本次相对上游的整合差异通过 `git diff --check FETCH_HEAD`。
 
+### 发布前检查补充
+
+- 真实 pre-push 以远端 `ddeb790` 为基线，首次发现 18 个上游原样源码的架构快照记录不完整，推送被阻止。逐项核实其在 `3c5b2276` 的 Git blob、文件模式及当前暂存区/工作区一致后，补齐固定内容与 introduced 记录，未修改架构规则或跳过 hook。
+- `pnpm architecture:check --changed --base ddeb790846616fe13c837718765947d00e252f89` 通过，0 个违规；推送前 schema 检查 8 项通过，两个数据库 schema 均兼容；架构测试 35 项通过、1 项平台相关跳过。
+
 详细范围：[`2026-10-20-upstream-main-merge.md`](superpowers/specs/2026-10-20-upstream-main-merge.md)。
 
 ## 2026-09-22
