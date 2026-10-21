@@ -33,7 +33,7 @@ const MAX_PLAN_MODE_MODEL_BYTES = 100_000;
 
 const EXIT_PLAN_MODE_DESCRIPTION = EXIT_PLAN_MODE_MODEL_INSTRUCTIONS[0];
 
-const enterPlanModeHandler: ToolHandler = async (input, context) => {
+export const enterPlanModeHandler: ToolHandler = async (input, context) => {
   EnterPlanModeInputSchema.parse(input);
   assertSessionModePort(context, ENTER_PLAN_MODE_TOOL_NAME);
 
@@ -57,7 +57,7 @@ const enterPlanModeHandler: ToolHandler = async (input, context) => {
   } satisfies EnterPlanModeOutput;
 };
 
-const exitPlanModeHandler: ToolHandler = async (input, context) => {
+export const exitPlanModeHandler: ToolHandler = async (input, context) => {
   const parsed = ExitPlanModeInputSchema.parse(input) as ExitPlanModeInput;
   assertSessionModePort(context, EXIT_PLAN_MODE_TOOL_NAME);
 
@@ -107,7 +107,9 @@ export const enterPlanModeToolEntry: ToolEntry = {
   capability: "Enter read-only planning mode before implementation",
   requiresUserInteraction: false,
   metadata: {
+    shouldDefer: true,
     name: ENTER_PLAN_MODE_TOOL_NAME,
+    searchHint: "switch to plan mode to design an approach before coding",
     description: ENTER_PLAN_MODE_PROVIDER_DESCRIPTION,
     readOnly: false,
     destructive: false,
@@ -154,7 +156,9 @@ export const exitPlanModeToolEntry: ToolEntry = {
   capability: "Request user approval for the plan and exit planning mode before coding",
   requiresUserInteraction: true,
   metadata: {
+    shouldDefer: true,
     name: EXIT_PLAN_MODE_TOOL_NAME,
+    searchHint: "present plan for approval and start coding (plan mode only)",
     description: EXIT_PLAN_MODE_DESCRIPTION,
     readOnly: false,
     destructive: false,

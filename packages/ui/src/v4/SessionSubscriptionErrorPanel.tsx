@@ -1,12 +1,12 @@
 import { useCallback } from "react";
-import { TID_V4_RETRY_SUBSCRIBE } from "@zcode/shared";
+import { TID_V4_RETRY_SUBSCRIBE } from "@zcode/shared/test-ids";
 import { Button } from "@/components/ui/button.js";
 import { toast } from "@/components/ui/toast.js";
 import { useFeedbackStore } from "@/feedback/feedbackStore.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { buildErrorFeedbackDescription } from "@/lib/errorFeedbackDraft.js";
 
-interface SessionSubscriptionErrorPanelProps {
+export interface SessionSubscriptionErrorPanelProps {
   error: string;
   sessionId: string;
   workspacePath: string;
@@ -27,7 +27,7 @@ export function SessionSubscriptionErrorPanel({
       type: "bug",
       module: "Agent任务执行失败",
       severity: "P2-中",
-      includeLogs: false,
+      includeLogs: true,
       description: buildErrorFeedbackDescription({
         message: error,
         contextLines: [

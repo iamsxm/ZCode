@@ -1,3 +1,4 @@
+/* eslint-disable max-lines -- 八类 strict telemetry fact 的同源归一集中维护，避免 privacy allowlist 分叉。 */
 import type {
   CompactLifecyclePayload,
   DynamicWorkflowRunProgressPayload,
@@ -19,7 +20,7 @@ import type {
   TurnStartedPayload,
 } from "@zcode/contracts";
 import { getModelUsageTotalTokens, SessionEventType } from "@zcode/contracts";
-import { parseAutomationRunId } from "@zcode/shared";
+import { parseAutomationRunId, sanitizeTelemetrySkillName } from "@zcode/shared";
 import { workflowLifecycleFactFromProgress } from "./conversation-telemetry-workflow-facts.js";
 import {
   conversationTelemetryFactSchema,
@@ -107,7 +108,11 @@ function skillTelemetryFactFields(
   const qualifiedName = optionalString(value.qualifiedName);
   const pluginId = optionalString(value.pluginId);
   const source = optionalString(value.source);
+  // 仅消费加载结果 metadata；请求参数不证明技能存在，不能进入遥测。
+  const name =
+    source && value.name !== undefined ? sanitizeTelemetrySkillName(value.name) : undefined;
   return {
+    ...(name ? { skillName: name } : {}),
     ...(qualifiedName ? { skillQualifiedName: qualifiedName } : {}),
     ...(pluginId ? { skillPluginId: pluginId } : {}),
     ...(source ? { skillSource: source } : {}),
@@ -117,13 +122,16 @@ function skillTelemetryFactFields(
 export function streamingParentToolCallId(payload: Record<string, unknown>): string | undefined {
   const meta = recordValue(payload._meta);
   const zcode = recordValue(meta.zcode);
+  const claudeCode = recordValue(meta.claudeCode);
   return (
     optionalString(payload.parentToolCallId) ??
     optionalString(payload.parentToolUseId) ??
     optionalString(meta.parentToolCallId) ??
     optionalString(meta.parentToolUseId) ??
     optionalString(zcode.parentToolCallId) ??
-    optionalString(zcode.parentToolUseId)
+    optionalString(zcode.parentToolUseId) ??
+    optionalString(claudeCode.parentToolCallId) ??
+    optionalString(claudeCode.parentToolUseId)
   );
 }
 
@@ -508,6 +516,9 @@ export class ConversationTelemetryFactNormalizer {
             : {}),
           ...(result?.result.error ? { errorMessage: result.result.error.message } : {}),
           ...skillTelemetryFactFields(toolName, error?.skillMetadata ?? result?.skillMetadata),
+          ...((error?.pluginId ?? result?.pluginId)
+            ? { pluginId: error?.pluginId ?? result?.pluginId, pluginComponent: "mcp" }
+            : {}),
           // subagent mirror 把父子关联放在工具事件 payload 顶层，旧 normalizer
           // 只读取 result.display，导致 agent_id 等字段在进入 agent_step 前被静默丢弃。
           ...mirroredSubagentToolFields(rawPayload, display),

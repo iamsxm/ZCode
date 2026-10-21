@@ -182,7 +182,7 @@ function recorderHtml(): string {
                   if (!chunkEvent.data || chunkEvent.data.size === 0) return;
                   chunkQueue = chunkQueue.then(async () => {
                     const bytes = await chunkEvent.data.arrayBuffer();
-                    // DOM MessagePort → Electron MessagePortMain 对 ArrayBuffer transfer
+                    // Bug 原因：DOM MessagePort → Electron MessagePortMain 对 ArrayBuffer transfer
                     // 在部分 Electron 平台会静默丢弃整条消息；让 structured clone 复制分片才能
                     // 保证 dataavailable 与后续 stopped 都按序抵达 main。
                     port.postMessage({ type: "chunk", data: bytes });
@@ -381,7 +381,11 @@ export async function createElectronBrowserWebmRecorder(
       `[browser-recording] recorder console level=${details.level ?? "unknown"} message=${details.message ?? ""}`,
     );
   };
-  recorderWindow.webContents.on("console-message", onConsoleMessage);
+  const recorderConsoleEvents = recorderWindow.webContents as unknown as {
+    on(event: "console-message", listener: typeof onConsoleMessage): void;
+    removeListener(event: "console-message", listener: typeof onConsoleMessage): void;
+  };
+  recorderConsoleEvents.on("console-message", onConsoleMessage);
 
   const cleanup = async (cancel: boolean): Promise<void> => {
     if (closed) return;
@@ -402,7 +406,7 @@ export async function createElectronBrowserWebmRecorder(
     closePort(rendererPort);
     clearDisplayMediaHandler(recorderSession);
     recorderWindow.webContents.removeListener("render-process-gone", onRendererGone);
-    recorderWindow.webContents.removeListener("console-message", onConsoleMessage);
+    recorderConsoleEvents.removeListener("console-message", onConsoleMessage);
     closeWindow(recorderWindow);
     await rm(recorderDocumentPath, { force: true }).catch(() => undefined);
   };
@@ -432,11 +436,7 @@ export async function createElectronBrowserWebmRecorder(
     await recorderWindow.loadFile(recorderDocumentPath);
     await rm(recorderDocumentPath, { force: true }).catch(() => undefined);
     recorderWindow.webContents.postMessage(RECORDER_PORT_CHANNEL, null, [rendererPort]);
-    await withTimeout(
-      ready.promise,
-      RECORDER_START_TIMEOUT_MS,
-      "recorder renderer did not become ready",
-    );
+    await withTimeout(ready.promise, RECORDER_START_TIMEOUT_MS, "recorder renderer did not become ready");
     mainPort.postMessage({
       type: "start",
       fps: input.fps,

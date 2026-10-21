@@ -9,7 +9,7 @@ import {
   conversationShareContinuationDataSchema,
   conversationShareContinuationRequestSchema,
   conversationShareErrorEnvelopeSchema,
-  conversationShareKnownErrorCodeSchema,
+  classifyConversationShareError,
   conversationSharePreparationDataSchema,
   conversationSharePreparationRequestSchema,
   conversationSharePreviewDataSchema,
@@ -18,7 +18,8 @@ import {
   isConversationShareSchemaVersionSupported,
   type ApiClient,
   type ApiRequestInit,
-  type ConversationShareApiErrorCode,
+  type ConversationShareErrorKind,
+  type ConversationShareRejection,
   type ConversationShareArtifactDescriptor,
   type ConversationShareArtifactUpload,
   type ConversationShareCapabilities,
@@ -30,49 +31,40 @@ import {
   type ConversationSharePreview,
   type ConversationShareRecord,
 } from "@zcode/shared";
-import type { z } from "zod";
+import { z } from "zod";
 import { createServiceLogger } from "../logger/serviceLogger.js";
 import { REQUEST_ID_HEADER_NAME, withRequestIdHeader } from "../providers/api/requestIdHeaders.js";
 import { verifyConversationShareIntegrity } from "./conversationShareIntegrity.js";
 
 const log = createServiceLogger("conversation-share-http");
 
-export type ConversationShareClientErrorKind =
-  | "authentication_required"
-  | "feature_disabled"
-  | "invalid_contract"
-  | "invalid_conversation"
-  | "disclosure_required"
-  | "unsafe_structure"
-  | "artifact_not_allowed"
-  | "limit_exceeded"
-  | "upload_incomplete"
-  | "not_found"
-  | "expired"
-  | "import_not_allowed"
-  | "rate_limited"
-  | "network"
-  | "safety_check_pending"
-  | "unsupported_schema_version"
-  | "unknown";
+export type ConversationShareClientErrorKind = ConversationShareErrorKind;
 
 export class ConversationShareClientError extends Error {
   readonly kind: ConversationShareClientErrorKind;
   readonly status?: number;
-  readonly code?: ConversationShareApiErrorCode;
+  readonly code?: number;
   /** 服务端响应的请求 ID，用于和后端日志对账。 */
   readonly requestId?: string;
   /** 复用现有 RPC details 字段，把安全诊断信息传到 Renderer。 */
-  readonly details?: { requestId?: string };
+  readonly details?: {
+    requestId?: string;
+    clientRequestId?: string;
+    status?: number;
+    code?: number;
+    rejection?: ConversationShareRejection;
+  };
   declare readonly retryAfterMs?: number;
 
   constructor(options: {
     kind: ConversationShareClientErrorKind;
     message: string;
     status?: number;
-    code?: ConversationShareApiErrorCode;
+    code?: number;
+    rejection?: ConversationShareRejection;
     retryAfterMs?: number;
     requestId?: string;
+    clientRequestId?: string;
     cause?: unknown;
   }) {
     super(options.message, options.cause === undefined ? undefined : { cause: options.cause });
@@ -83,32 +75,25 @@ export class ConversationShareClientError extends Error {
     const requestId = options.requestId?.trim();
     if (requestId && /^[A-Za-z0-9._:-]{1,128}$/u.test(requestId)) {
       this.requestId = requestId;
-      this.details = { requestId };
+    }
+    const clientRequestId = normalizeRequestId(options.clientRequestId);
+    if (
+      this.requestId ||
+      clientRequestId ||
+      options.status !== undefined ||
+      options.code !== undefined
+    ) {
+      this.details = {
+        ...(this.requestId ? { requestId: this.requestId } : {}),
+        ...(clientRequestId ? { clientRequestId } : {}),
+        ...(options.status === undefined ? {} : { status: options.status }),
+        ...(options.code === undefined ? {} : { code: options.code }),
+        ...(options.rejection ? { rejection: options.rejection } : {}),
+      };
     }
     if (options.retryAfterMs !== undefined) this.retryAfterMs = options.retryAfterMs;
   }
 }
-
-const ERROR_KIND_BY_CODE: Record<ConversationShareApiErrorCode, ConversationShareClientErrorKind> =
-  {
-    3001: "invalid_contract",
-    3002: "rate_limited",
-    3200: "feature_disabled",
-    3201: "authentication_required",
-    3203: "invalid_contract",
-    3204: "invalid_contract",
-    3205: "invalid_conversation",
-    3206: "disclosure_required",
-    3207: "unsafe_structure",
-    3208: "artifact_not_allowed",
-    3209: "limit_exceeded",
-    3210: "upload_incomplete",
-    3211: "not_found",
-    3212: "expired",
-    3213: "authentication_required",
-    3214: "import_not_allowed",
-    3215: "safety_check_pending",
-  };
 
 const IMF_FIXDATE_PATTERN =
   /^(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), (?:0[1-9]|[12]\d|3[01]) (?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) \d{4} (?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d GMT$/u;
@@ -207,7 +192,7 @@ function normalizeRequestId(value: string | null | undefined): string | undefine
   return trimmed && /^[A-Za-z0-9._:-]{1,128}$/u.test(trimmed) ? trimmed : undefined;
 }
 
-interface ConversationShareHttpClientOptions {
+export interface ConversationShareHttpClientOptions {
   apiClient: ApiClient;
   baseUrl: string;
   tokenProvider: () => Promise<string | null>;
@@ -342,6 +327,7 @@ export class ConversationShareHttpClient {
     if (
       !verifyConversationShareIntegrity({
         rawRows: wire.rows,
+        rawContentBlocks: wire.content_blocks,
         rawArtifacts: wire.artifacts,
         integrity: wire.integrity,
       })
@@ -422,6 +408,7 @@ export class ConversationShareHttpClient {
     const headers = withRequestIdHeader(init.headers);
     if (token) headers.set("Authorization", `Bearer ${token}`);
     const url = joinUrl(this.baseUrl, path);
+    const clientRequestId = normalizeRequestId(headers.get(REQUEST_ID_HEADER_NAME));
     let response: Response;
     try {
       response = await this.apiClient.request(url, {
@@ -432,83 +419,91 @@ export class ConversationShareHttpClient {
     } catch (error) {
       if (error instanceof ConversationShareClientError) throw error;
       throw new ConversationShareClientError({
+        clientRequestId,
         kind: "network",
         message: error instanceof Error ? error.message : "Conversation share network error",
         cause: error,
       });
     }
 
-    const text = await response.text();
     const responseRequestId = normalizeRequestId(response.headers.get(REQUEST_ID_HEADER_NAME));
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (cause) {
+      // 响应头已经收到，读取中断仍是网络错误；不能丢失状态和请求 ID 后落进 unknown。
+      log.warn(undefined, "conversation share response body interrupted", {
+        path,
+        method: init.method ?? "GET",
+        status: response.status,
+        requestId: responseRequestId,
+        clientRequestId,
+      });
+      throw new ConversationShareClientError({
+        clientRequestId,
+        kind: "network",
+        message: "Conversation share response body interrupted",
+        status: response.status,
+        requestId: responseRequestId,
+        cause,
+      });
+    }
     if (!response.ok) {
-      if (response.status === 401 && !text.trim()) {
-        throw new ConversationShareClientError({
-          kind: "authentication_required",
-          message: "Conversation share authentication required",
-          status: 401,
-          requestId: responseRequestId,
-        });
-      }
+      const mediaType = response.headers.get("content-type")?.split(";", 1)[0]?.trim();
+      log.warn(undefined, "conversation share HTTP response diagnostics", {
+        path,
+        method: init.method ?? "GET",
+        status: response.status,
+        requestId: responseRequestId,
+        clientRequestId,
+        responseBytes: new TextEncoder().encode(text).byteLength,
+        mediaType:
+          mediaType && /^[a-z0-9.+-]+\/[a-z0-9.+-]+$/iu.test(mediaType) ? mediaType : "unknown",
+        responseFormat: /^\s*</u.test(text) ? "html" : "other",
+        redirected: response.redirected,
+      });
       let parsedError: ReturnType<typeof conversationShareErrorEnvelopeSchema.safeParse> | null =
         null;
       if (text.trim()) {
         try {
           parsedError = conversationShareErrorEnvelopeSchema.safeParse(parseJson(text));
-        } catch (error) {
-          // 网关的 502/504 可能返回 HTML 错误页。5xx 的非 JSON 响应归为 network，
-          // 避免将基础设施故障误报为响应契约错误；其他状态的解析失败仍归为 invalid_contract。
-          if (response.status >= 500) {
-            log.warn(undefined, "conversation share API upstream unavailable", {
-              path,
-              method: init.method ?? "GET",
-              status: response.status,
-              requestId: responseRequestId,
-            });
-            throw new ConversationShareClientError({
-              kind: "network",
-              message: `Conversation share API upstream failed with HTTP ${response.status}`,
-              status: response.status,
-              ...(responseRequestId === undefined ? {} : { requestId: responseRequestId }),
-              cause: error,
-            });
-          }
-          log.warn(undefined, "conversation share API returned invalid JSON", {
-            path,
-            method: init.method ?? "GET",
-            status: response.status,
-            requestId: responseRequestId,
-          });
-          throw new ConversationShareClientError({
-            kind: "invalid_contract",
-            message: "Conversation share API returned invalid JSON",
-            status: response.status,
-            ...(responseRequestId === undefined ? {} : { requestId: responseRequestId }),
-            cause: error,
-          });
+        } catch {
+          // 网关 HTML/纯文本错误仍按 HTTP 分类，不把限流、鉴权或服务故障误报为内容问题。
+          parsedError = null;
         }
       }
       if (parsedError?.success) {
         // 未知业务码不再让整条信封解析失败（那样会丢掉服务端 msg，退化成没有上下文的
-        // "HTTP 4xx"）。认得的码走既有映射，认不得的落 unknown 但保留 msg 与 status。
-        const knownCode = conversationShareKnownErrorCodeSchema.safeParse(parsedError.data.code);
-        const code = knownCode.success ? knownCode.data : undefined;
-        const kind = code === undefined ? "unknown" : ERROR_KIND_BY_CODE[code];
+        // "HTTP 4xx"）。保留原始数字码，未知码按 HTTP 分类以区分服务故障。
+        const { code, data: rejection, logid } = parsedError.data;
+        const kind = classifyConversationShareError(response.status, code);
+        const millisecondHeader = response.headers.get("retry-after-ms")?.trim();
+        const milliseconds =
+          millisecondHeader && /^\d+$/u.test(millisecondHeader) ? Number(millisecondHeader) : NaN;
         const retryAfterMs =
-          code === 3215 ? parseRetryAfterMs(response.headers.get("retry-after")) : undefined;
+          code === 3215
+            ? Number.isSafeInteger(milliseconds) && milliseconds > 0
+              ? milliseconds
+              : parseRetryAfterMs(response.headers.get("retry-after"))
+            : undefined;
+        const requestId = responseRequestId ?? logid;
         log.warn(undefined, "conversation share API request rejected", {
           path,
           method: init.method ?? "GET",
           status: response.status,
           kind,
-          code: parsedError.data.code,
-          requestId: responseRequestId,
+          code,
+          requestId,
+          rejection,
         });
         throw new ConversationShareClientError({
+          clientRequestId,
           kind,
           message: parsedError.data.msg,
           status: response.status,
-          ...(code === undefined ? {} : { code }),
-          requestId: responseRequestId,
+          code,
+          requestId,
+          rejection,
           ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
         });
       }
@@ -518,11 +513,9 @@ export class ConversationShareHttpClient {
         status: response.status,
         requestId: responseRequestId,
       });
-      // 空 body 或 body 不是合法错误 envelope 时的兜底分类：5xx 是基础设施故障（network），
-      // 不能落进 unknown/invalid_contract；429 维持 rate_limited，其余才是 unknown。
       throw new ConversationShareClientError({
-        kind:
-          response.status >= 500 ? "network" : response.status === 429 ? "rate_limited" : "unknown",
+        clientRequestId,
+        kind: classifyConversationShareError(response.status),
         message: `Conversation share API failed with HTTP ${response.status}`,
         status: response.status,
         ...(responseRequestId === undefined ? {} : { requestId: responseRequestId }),
@@ -536,12 +529,54 @@ export class ConversationShareHttpClient {
       return envelope.data;
     } catch (error) {
       if (error instanceof ConversationShareClientError) throw error;
+      // 校验器消息可能包含响应值；只记录固定字段名和类型，动态键名也不能进入日志。
+      const diagnosticFields = new Set([
+        "code",
+        "msg",
+        "data",
+        "preparation_id",
+        "status",
+        "access_mode",
+        "expires_at",
+        "share",
+        "share_code",
+        "share_url",
+        "schema_version",
+        "artifact_id",
+        "size_bytes",
+        "sha256",
+        "safety_status",
+        "projection",
+        "rows",
+        "artifacts",
+        "integrity",
+      ]);
+      log.warn(undefined, "conversation share success response parsing failed", {
+        path,
+        method: init.method ?? "GET",
+        status: response.status,
+        requestId: responseRequestId,
+        clientRequestId,
+        responseBytes: new TextEncoder().encode(text).byteLength,
+        responseFormat: error instanceof z.ZodError ? "schema_mismatch" : "invalid_json",
+        ...(error instanceof z.ZodError
+          ? {
+              issueCount: error.issues.length,
+              issues: error.issues.slice(0, 10).map((issue) => ({
+                path: issue.path.map((part) =>
+                  typeof part === "number" || diagnosticFields.has(String(part)) ? part : "<field>",
+                ),
+                code: issue.code,
+              })),
+            }
+          : {}),
+      });
       throw new ConversationShareClientError({
+        clientRequestId,
         kind: "invalid_contract",
         message: "Conversation share API response does not match the client contract",
         status: response.status,
         ...(responseRequestId === undefined ? {} : { requestId: responseRequestId }),
-        cause: error,
       });
     }
   }

@@ -12,7 +12,7 @@ import {
   type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from "react";
-import { TID_V4_SPLIT_DIVIDER } from "@zcode/shared";
+import { TID_V4_SPLIT_DIVIDER } from "@zcode/shared/test-ids";
 import { cn } from "@/components/lib/utils.js";
 import { clampSplitRatio, type SplitDirection } from "@/v4/paneLayoutTree.js";
 import { SPLIT_VAR_PREFIX } from "@/v4/workbenchLayout.js";
@@ -27,7 +27,7 @@ interface SplitDividerDragState {
   rafId: number | null;
 }
 
-interface WorkbenchSplitDividerProps {
+export interface WorkbenchSplitDividerProps {
   containerRef: RefObject<HTMLDivElement | null>;
   splitId: string;
   direction: SplitDirection;
@@ -81,7 +81,8 @@ export const WorkbenchSplitDivider = memo(function WorkbenchSplitDivider({
       const client = isRow ? event.clientX : event.clientY;
       dragRef.current = {
         pointerId: event.pointerId,
-        regionPx: (isRow ? containerRect.width : containerRect.height) * regionFraction,
+        regionPx:
+          (isRow ? containerRect.width : containerRect.height) * regionFraction,
         startClient: client,
         startRatio: ratio,
         latestClient: client,
@@ -125,7 +126,10 @@ export const WorkbenchSplitDivider = memo(function WorkbenchSplitDivider({
       }
       drag.latestClient = isRow ? event.clientX : event.clientY;
       const finalRatio = ratioFromDrag(drag);
-      containerRef.current?.style.setProperty(`${SPLIT_VAR_PREFIX}${splitId}`, String(finalRatio));
+      containerRef.current?.style.setProperty(
+        `${SPLIT_VAR_PREFIX}${splitId}`,
+        String(finalRatio),
+      );
       dragRef.current = null;
       setDragging(false);
       // 提交进 store（→ localStorage）；容器 style 下次渲染写入同值，无视觉跳变。

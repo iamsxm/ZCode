@@ -1,5 +1,6 @@
 /* oxlint-disable eslint(max-lines) -- input attachment staging and preview artifact discovery share one immutable snapshot boundary. */
 import { createHash } from "node:crypto";
+import { isWorkflowShareFallbackRow } from "#src/conversation-share/conversationShareWorkflowSnapshot.js";
 
 import {
   buildConversationPreviewArtifactCandidates,
@@ -40,7 +41,7 @@ interface DiscoveredShareArtifact extends MaterializedShareArtifact {
   row: ArtifactRow;
 }
 
-interface ConversationShareArtifactSnapshot {
+export interface ConversationShareArtifactSnapshot {
   rows: ConversationRow[];
   bytesBySourceRef: Map<string, Uint8Array>;
   additionalArtifacts: ConversationSharePublicArtifact[];
@@ -115,15 +116,19 @@ async function materializeRegisteredArtifacts(options: {
   workspacePath: string;
   maxArtifactBytes: number;
   artifacts: ConversationSharePublicArtifact[];
+  inlineBytesBySourceRef?: ReadonlyMap<string, Uint8Array>;
   artifactSource: ConversationShareArtifactSource;
 }): Promise<MaterializedShareArtifact[]> {
   const materialized: MaterializedShareArtifact[] = [];
   for (const artifact of options.artifacts) {
-    const { bytes, canonicalPath } = await options.artifactSource.read({
-      workspacePath: options.workspacePath,
-      ref: artifact.sourceRef,
-      maxBytes: options.maxArtifactBytes,
-    });
+    const inlineBytes = options.inlineBytesBySourceRef?.get(artifact.sourceRef);
+    const { bytes, canonicalPath } = inlineBytes
+      ? { bytes: inlineBytes, canonicalPath: artifact.sourceRef }
+      : await options.artifactSource.read({
+          workspacePath: options.workspacePath,
+          ref: artifact.sourceRef,
+          maxBytes: options.maxArtifactBytes,
+        });
     const sha256 = createHash("sha256").update(bytes).digest("hex");
     // Row 在工具完成时记录，用户可能在发布前修改同一路径；必须复验当前字节，
     // 否则 projection/manifest 描述的是旧文件而 multipart 上传的是新文件。
@@ -179,7 +184,8 @@ async function discoverPreviewArtifacts(options: {
   }
   const assistantTextByProductTurnId = new Map<string, string[]>();
   for (const row of options.selectedRows) {
-    if (row.kind !== "assistantText" || !row.productTurnId) continue;
+    if (row.kind !== "assistantText" || !row.productTurnId || isWorkflowShareFallbackRow(row))
+      continue;
     const texts = assistantTextByProductTurnId.get(row.productTurnId) ?? [];
     texts.push(row.text);
     assistantTextByProductTurnId.set(row.productTurnId, texts);
@@ -663,6 +669,7 @@ export async function buildConversationShareArtifactSnapshot(options: {
   input: PublishTextConversationInput;
   selectedRows: ConversationRow[];
   registeredArtifacts: ConversationSharePublicArtifact[];
+  inlineBytesBySourceRef?: ReadonlyMap<string, Uint8Array>;
   capabilities: ConversationShareCapabilities;
   revision: number;
   logEpoch: string;
@@ -685,6 +692,7 @@ export async function buildConversationShareArtifactSnapshot(options: {
     workspacePath: options.input.workspacePath,
     maxArtifactBytes: options.capabilities.max_artifact_bytes,
     artifacts: options.registeredArtifacts,
+    inlineBytesBySourceRef: options.inlineBytesBySourceRef,
     artifactSource: options.artifactSource,
   });
   const discovered = await discoverPreviewArtifacts({

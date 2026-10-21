@@ -1,3 +1,6 @@
+import { useToolPresentationHostCapabilities } from "@/hooks/useToolPresentationHostCapabilities.js";
+import { ToolPresentationCapabilitiesProvider } from "@/ToolCallBlocks/presentationCapabilities.js";
+import { ToolCallBlock } from "@/ToolCallBlocks.js";
 /* eslint-disable max-lines */
 import {
   useCallback,
@@ -21,6 +24,11 @@ import { cn } from "@/components/lib/utils.js";
 import { Textarea } from "@/components/ui/textarea.js";
 import { isImeComposingKeyEvent } from "@/lib/imeComposition.js";
 import {
+  resolveMobileInputTextSizeClassName,
+  shouldAvoidIosInputFocusZoom,
+  useIsMobileTextInputViewport,
+} from "@/lib/mobileTextInput.js";
+import {
   getPermissionOptionDisplayKind,
   getPermissionRequestPreview,
   shouldPreferPermissionOptionName,
@@ -37,11 +45,18 @@ import { ToolLayout } from "@/ToolCallBlocks/ToolLayout.js";
 import { EditToolCallBlock } from "@/ToolCallBlocks/renderers/edit.js";
 import { ExecuteToolCallBlock } from "@/ToolCallBlocks/renderers/execute.js";
 import { FallbackToolCallBlock } from "@/ToolCallBlocks/renderers/fallback.js";
+import { WebFetchToolCallBlock } from "@/ToolCallBlocks/renderers/web-fetch.js";
 import { SearchToolCallBlock } from "@/ToolCallBlocks/renderers/search.js";
 import { SkillToolCallBlock } from "@/ToolCallBlocks/renderers/skill.js";
 import { resolveToolCallIdentity } from "@/lib/toolIdentity.js";
 import { InteractionRequestOriginBadge } from "@/InteractionRequestOriginBadge.js";
 import { WorkflowPermissionBlock } from "@/WorkflowPermissionBlock.js";
+import {
+  focusLastWorkflowSettingsControl,
+  isWorkflowSettingsCarrier,
+  usePermissionWorkflowSettings,
+  workflowAdjustedOptionDescriptionId,
+} from "@/permissionWorkflowSettings.js";
 import { SaveWorkflowPermissionBlock } from "@/SaveWorkflowPermissionBlock.js";
 import { isSaveWorkflowToolCall } from "@/lib/workflowToolNames.js";
 import { useZCodeStoreWithDefault } from "@/store/StoreProvider.js";
@@ -55,6 +70,7 @@ type PermissionBlockKind =
   | "edit"
   | "execute"
   | "mcp"
+  | "web-fetch"
   | "search"
   | "skill"
   | "workflow"
@@ -298,6 +314,7 @@ function resolvePermissionBlockKind(
     return "workflow";
   }
 
+  if (identity.family === "web-fetch") return "web-fetch";
   if (identity.family === "search") {
     // WebFetch/WebSearch 权限请求以前落到 fallback，会把整包 toolCall JSON 打出来。
     // 这里和聊天区一样走 search renderer，只展示用户关心的 URL/query 摘要。
@@ -320,6 +337,7 @@ function getPermissionBlockInteraction(blockKind: PermissionBlockKind): Permissi
       };
     case "mcp":
     case "skill":
+    case "web-fetch":
     case "search":
     case "execute":
     case "workflow":
@@ -363,6 +381,7 @@ function buildPermissionBlockContext(
   const { canToggle, forceOpen } = getPermissionBlockInteraction(blockKind);
 
   return {
+    nestedToolRenderer: ToolCallBlock,
     toolCallNode: {
       toolCall,
       childToolCalls: [],
@@ -386,6 +405,8 @@ function buildPermissionBlockContext(
     // 权限弹窗等待用户确认时工具还没有执行，不能复用 running 状态。
     // 之前 Bash 权限会显示“执行中”并带 loading，遮住真正的申请原因。
     isRunning: false,
+    // 权限预览使用合成 completed 节点，必须显式区分，避免误报“没有输出”。
+    isPermissionPreview: true,
     statusLabel: "",
     childToolList: null,
     showIcon: true,
@@ -426,23 +447,63 @@ function McpPermissionBlock(context: ToolCallBlockRenderContext) {
   );
 }
 
+/**
+ * 保存确认窗：聚焦滚动区里最后一个控件（区内只有展开钮与脚本开关）。区不在或没有控件即返回 false，
+ * 交回选项列表自己的循环。
+ */
+function focusLastSaveWorkflowControl(root: HTMLElement | null): boolean {
+  const controls = root?.querySelectorAll<HTMLElement>(
+    "[data-permission-dialog-scroll] button:not([disabled])",
+  );
+  const last = controls === undefined ? undefined : controls[controls.length - 1];
+  if (last === undefined) return false;
+  last.focus();
+  return true;
+}
+
 export function PermissionDialog({
   request,
   onRespond,
   workspacePath,
+  workspaceIdentity,
+  remoteSessionId,
+  workflowSessionModel,
   provider,
+  isWebRemoteControl = false,
   responding = false,
   responseError,
 }: {
   request: ZCodePermissionRequest;
   responding?: boolean;
   responseError?: string;
-  onRespond: (requestId: string, option: ZCodePermissionOption, feedback?: string) => void;
+  /**
+   * `content` 只在工作流确认窗的放行应答上出现：用户在窗里改过的设置（docs/dynamic-workflow/launch.md
+   * 「Adjusting the settings in the window」）。没改过即不传。
+   */
+  onRespond: (
+    requestId: string,
+    option: ZCodePermissionOption,
+    feedback?: string,
+    content?: Record<string, unknown>,
+  ) => void;
   workspacePath: string;
+  /** 工作流确认窗的模型清单作用域与会话模型（宿主给）。 */
+  workspaceIdentity?: string;
+  remoteSessionId?: string;
+  workflowSessionModel?: { providerId: string; modelId: string };
   provider?: ZCodeProvider;
+  isWebRemoteControl?: boolean;
 }) {
   const { intl } = useZCodeIntl();
-  // store 耦合剥离：主题/代码预览设置在宿主处取 store，向下走 props/render context。
+  const presentationCapabilities = useToolPresentationHostCapabilities(workspacePath);
+  const isMobileTextInputViewport = useIsMobileTextInputViewport();
+  // Bug 根因：反馈输入也会渲染在手机 Web 远控的 PermissionDialog 中，14px 输入框聚焦时会触发 iOS 页面放大。
+  // 与 composer 复用同一套视口判断和 16px 兼容 token，桌面和非远控 Web 保持原有字号。
+  const avoidIosInputFocusZoom = shouldAvoidIosInputFocusZoom({
+    isMobileTextInputViewport,
+    isWebRemoteControl,
+  });
+  // M5②.5 store 耦合剥离：主题/代码预览设置在宿主处取 store，向下走 props/render context。
   const theme = useZCodeStoreWithDefault((state) => state.theme, "system");
   const codePreviewSettings = useZCodeStoreWithDefault(
     (state) => state.codePreviewSettings,
@@ -491,6 +552,16 @@ export function PermissionDialog({
     [blockKind, codePreviewSettings, intl, rawFileSummaries, theme, toolCall, workspacePath],
   );
   const displayReason = useMemo(() => getPermissionDisplayReason(request), [request]);
+  // 工作流确认窗的两项 run 设置（WorkflowPermissionBlock 画，这里只存改过的值与「模型不可用」）。
+  const isWorkflowAsk = blockKind === "workflow";
+  const workflowSettings = usePermissionWorkflowSettings(request.requestId);
+  const workflowSettingsContent = isWorkflowAsk ? workflowSettings.content : undefined;
+  const isOptionBlocked = useCallback(
+    (option: ZCodePermissionOption) =>
+      isWorkflowAsk && workflowSettings.blocked && isWorkflowSettingsCarrier(option),
+    [isWorkflowAsk, workflowSettings.blocked],
+  );
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [feedback, setFeedback] = useState("");
   const optionRefs = useRef<Array<HTMLButtonElement | null>>([]);
@@ -558,16 +629,33 @@ export function PermissionDialog({
 
   const respondWithOption = useCallback(
     (option: ZCodePermissionOption) => {
-      if (responding) return;
+      // 所选子代理模型已不可用：放行要等用户换一个，与「配置」弹层的 Apply 同一条规则。
+      if (responding || isOptionBlocked(option)) return;
       const selectedKind = getPermissionOptionDisplayKind(option.kind);
       // 通用确认窗里 Deny 顺带把反馈行草稿作为拒绝理由发出；工作流确认窗的草稿属于 Refine，
       // 点 Deny 就是普通拒绝——否则一段修改意见会以普通拒绝理由的身份发出，
       // 模型收不到 workflow_refine_feedback 的升级递送。
       const trimmedFeedback =
         !refineOption && selectedKind.startsWith("reject") ? feedback.trim() : "";
-      onRespond(request.requestId, option, trimmedFeedback || undefined);
+      const content =
+        workflowSettingsContent !== undefined && isWorkflowSettingsCarrier(option)
+          ? { ...workflowSettingsContent }
+          : undefined;
+      if (content === undefined) {
+        onRespond(request.requestId, option, trimmedFeedback || undefined);
+      } else {
+        onRespond(request.requestId, option, trimmedFeedback || undefined, content);
+      }
     },
-    [feedback, onRespond, refineOption, request.requestId, responding],
+    [
+      feedback,
+      isOptionBlocked,
+      onRespond,
+      refineOption,
+      request.requestId,
+      responding,
+      workflowSettingsContent,
+    ],
   );
 
   const submitFeedback = useCallback(() => {
@@ -649,6 +737,38 @@ export function PermissionDialog({
           moveSelection(1);
           return;
         case "Tab":
+          // 长命令新增了阅读按钮，旧的选项循环会困住焦点；第一项反向 Tab 交还浏览器，
+          // 按 DOM 顺序进入上方命令按钮，其正向 Tab 自然回到当前第一项，不触发授权。
+          if (
+            event.shiftKey &&
+            optionRefs.current.indexOf(event.currentTarget) === 0 &&
+            rootRef.current?.querySelector("[data-command-preview-toggle]")
+          ) {
+            return;
+          }
+          // 工作流确认窗：第一个选项上的 Shift+Tab 离开列表、回到上方的设置控件（阅读次序即焦点次序）。
+          // 按事件落在哪个按钮上判，不读 selectedIndex：聚焦与按键可能在同一帧，状态还没提交。
+          if (
+            event.shiftKey &&
+            optionRefs.current.indexOf(event.currentTarget) === 0 &&
+            isWorkflowAsk &&
+            focusLastWorkflowSettingsControl(rootRef.current)
+          ) {
+            event.preventDefault();
+            return;
+          }
+          // 保存确认窗同理：第一个选项上的 Shift+Tab 回到上方滚动区的最后一个控件，正向 Tab 再按 DOM
+          // 次序走回当前选项。Bugfix：这里原先没有出口，选项循环困住焦点，折叠起来的说明、参数与脚本
+          // 只能用鼠标展开。
+          if (
+            event.shiftKey &&
+            optionRefs.current.indexOf(event.currentTarget) === 0 &&
+            blockKind === "saveWorkflow" &&
+            focusLastSaveWorkflowControl(rootRef.current)
+          ) {
+            event.preventDefault();
+            return;
+          }
           event.preventDefault();
           moveSelection(event.shiftKey ? -1 : 1);
           return;
@@ -661,9 +781,11 @@ export function PermissionDialog({
       }
     },
     [
+      blockKind,
       confirmSelection,
       feedbackIndex,
       hasFeedbackInput,
+      isWorkflowAsk,
       moveSelection,
       orderedOptions,
       respondWithOption,
@@ -677,23 +799,54 @@ export function PermissionDialog({
         ? McpPermissionBlock
         : blockKind === "skill"
           ? SkillToolCallBlock
-          : blockKind === "search"
-            ? SearchToolCallBlock
-            : blockKind === "execute"
-              ? ExecuteToolCallBlock
-              : FallbackToolCallBlock;
+          : blockKind === "web-fetch"
+            ? WebFetchToolCallBlock
+            : blockKind === "search"
+              ? SearchToolCallBlock
+              : blockKind === "execute"
+                ? ExecuteToolCallBlock
+                : FallbackToolCallBlock;
   // 当前 ZCode Agent 的 ExitPlanMode 权限请求不再传 legacy switch_mode。
   // 这里复用 tool identity，避免审批弹窗和聊天区的计划模式工具分流再次漂移。
   const shouldUseSwitchModePlaceholder = resolveToolCallIdentity(toolCall).family === "switch-mode";
   // 工作流确认窗自带本地化标题（「运行此工作流？」）和图主体，走独立块而不是通用预览块。
-  const shouldUseWorkflowBlock = blockKind === "workflow";
+  const shouldUseWorkflowBlock = isWorkflowAsk;
   // 保存确认窗同理，但问句、内容与选项都不同：没有图、没有 Refine，主体是落点 + 元数据 + 脚本。
   const shouldUseSaveWorkflowBlock = blockKind === "saveWorkflow";
+  // 限高布局目前只给保存确认窗（docs/dynamic-workflow/launch.md「`SaveWorkflow`」第 4 步）：窗口上限与
+  // 问答窗（ElicitationDialog）相同；选项以上全部内容是**唯一**的纵向滚动区，选项、反馈行与确认
+  // 隔一条细线钉在下面。滚动区用负外边距铺满窗宽，滚动条贴窗口边缘、细线横贯整窗。
+  // Bugfix：上一版问句钉顶、中段滚动、段内三块各自滚动、窗口再兜底滚动，最多五层滚动容器叠在
+  // 一起，一次滚轮手势的去向取决于指针恰好在哪个框上；块内的长内容改为折叠后，这里只剩一层。
+  // 钉底只在屏幕够高（≥36rem）时成立：选项、最多 5 行的反馈、错误行与确认栏本身就有约 320px，
+  // 矮屏（如横屏手机）上它们会高过上限、被窗口裁掉，确认按钮跟着消失。所以基础布局是整窗一个
+  // 滚动区（选项随内容滚动），够高才切到「选项以上滚、选项钉底」；两种高度下都只有一个滚动容器。
+  const bounded = shouldUseSaveWorkflowBlock;
   return (
-    <div className="w-full shrink-0 relative z-1">
-      <div className="w-full overflow-hidden rounded-2xl border border-border bg-popover shadow-xs">
-        <div className="flex flex-col gap-3 p-3">
-          <div className="space-y-4">
+    <div ref={rootRef} className="w-full shrink-0 relative z-1">
+      <div
+        className={cn(
+          "w-full rounded-2xl border border-border bg-popover shadow-xs",
+          bounded
+            ? "max-h-[min(72dvh,42rem)] overflow-y-auto overscroll-contain [@media(min-height:36rem)]:flex [@media(min-height:36rem)]:flex-col [@media(min-height:36rem)]:overflow-hidden"
+            : "overflow-hidden",
+        )}
+        {...(bounded ? { "data-permission-dialog-bounded": "true" } : {})}
+      >
+        <div
+          className={cn(
+            "flex flex-col gap-3 p-3",
+            bounded && "[@media(min-height:36rem)]:min-h-0 [@media(min-height:36rem)]:flex-1",
+          )}
+        >
+          <div
+            className={cn(
+              "space-y-4",
+              bounded &&
+                "-mx-3 -mt-3 border-b border-border p-3 [@media(min-height:36rem)]:min-h-0 [@media(min-height:36rem)]:overflow-y-auto [@media(min-height:36rem)]:overscroll-contain",
+            )}
+            {...(bounded ? { "data-permission-dialog-scroll": "true" } : {})}
+          >
             <div className="flex flex-wrap items-center gap-2">
               <p className="text-ui-base font-medium leading-tight text-foreground-subtle">
                 {intl.formatMessage({ id: "chat.permission.title" })}
@@ -718,17 +871,31 @@ export function PermissionDialog({
             ) : shouldUseWorkflowBlock ? (
               // CLI 侧的 reason 是给协议诊断用的（"createWorkflow.runConfirmation: ..."），
               // 这里刻意不渲染 displayReason：块内的本地化标题才是给用户看的那句问句。
-              <WorkflowPermissionBlock request={request} workspacePath={workspacePath} />
+              <WorkflowPermissionBlock
+                onSettingsBlockedChange={workflowSettings.onBlockedChange}
+                onSettingsChange={workflowSettings.onContentChange}
+                request={request}
+                settingsDisabled={responding}
+                workspacePath={workspacePath}
+                {...(workspaceIdentity === undefined ? {} : { workspaceIdentity })}
+                {...(remoteSessionId === undefined ? {} : { remoteSessionId })}
+                {...(workflowSessionModel === undefined
+                  ? {}
+                  : { sessionModel: workflowSessionModel })}
+              />
             ) : shouldUseSaveWorkflowBlock ? (
               // 同上：保存 gate 的问句（保存 / 覆盖两句）由块自己给出，不复用协议 reason。
               <SaveWorkflowPermissionBlock request={request} />
             ) : (
-              <PermissionBlock {...blockContext} />
+              // 审批直接使用 renderer，绕过 ToolCallBlock 时也必须提供宿主展示能力。
+              <ToolPresentationCapabilitiesProvider value={presentationCapabilities}>
+                <PermissionBlock {...blockContext} />
+              </ToolPresentationCapabilitiesProvider>
             )}
           </div>
 
           {/* 反馈行曾被外层 gap-3 隔开；用同一 4px 视觉分组，保留 listbox 的权限选项边界。 */}
-          <div className="space-y-1">
+          <div className="shrink-0 space-y-1">
             <div
               role="listbox"
               aria-label={intl.formatMessage({ id: "chat.permission.title" })}
@@ -744,12 +911,19 @@ export function PermissionDialog({
                     ? "chat.permission.allowCommand"
                     : getOptionLabelMessageId(option.kind);
                 const nameMessageIds = getProviderOptionNameMessageIds(provider, option.name);
-                const descriptionMessageId = officialCuaProjectPermission
+                const baseDescriptionMessageId = officialCuaProjectPermission
                   ? "chat.permission.cua.allowForProject.description"
                   : labelMessageId === "chat.permission.allowCommand"
                     ? "chat.permission.allowCommand.description"
                     : (nameMessageIds?.description ??
                       getOptionDescriptionMessageId(option.kind, preview.scope));
+                // 工作流确认窗改过设置：放行的两项改口说「按调整后的设置」（docs/dynamic-workflow/launch.md
+                // 「The options」）。
+                const descriptionMessageId =
+                  workflowSettingsContent === undefined
+                    ? baseDescriptionMessageId
+                    : workflowAdjustedOptionDescriptionId(baseDescriptionMessageId);
+                const blocked = isOptionBlocked(option);
                 const fallbackLabel = labelMessageId
                   ? intl.formatMessage({ id: labelMessageId })
                   : null;
@@ -787,6 +961,7 @@ export function PermissionDialog({
                     role="option"
                     aria-label={label}
                     aria-selected={isSelected}
+                    {...(blocked ? { "aria-disabled": true } : {})}
                     tabIndex={isSelected ? 0 : -1}
                     onClick={() => {
                       if (isSelected) {
@@ -800,6 +975,7 @@ export function PermissionDialog({
                     className={cn(
                       "flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left outline-none transition-colors focus-visible:bg-selected",
                       isSelected ? "bg-selected" : "hover:bg-hover",
+                      blocked && "cursor-not-allowed opacity-50",
                     )}
                   >
                     <span
@@ -842,7 +1018,8 @@ export function PermissionDialog({
                 <span
                   className={cn(
                     // 匹配 textarea 的首行行高和 1px 边框；手机输入行高不同，但序号字号不变。
-                    "mt-px w-5 shrink-0 self-start text-ui-base font-medium leading-5 md:leading-relaxed",
+                    "mt-px w-5 shrink-0 self-start text-ui-base font-medium md:leading-relaxed",
+                    avoidIosInputFocusZoom ? "leading-6" : "leading-5",
                     isFeedbackSelected ? "text-foreground" : "text-foreground-subtlest",
                   )}
                 >
@@ -884,8 +1061,9 @@ export function PermissionDialog({
                   }}
                   onKeyDown={handleFeedbackKeyDown}
                   className={cn(
-                    // 拒绝反馈自动换行，但限制为 5 行并在输入框内滚动，避免窄屏遮住权限选项和确认按钮。
-                    "h-auto !min-h-5 max-h-[5lh] min-w-0 max-w-full overflow-y-auto rounded-none border-transparent bg-transparent !px-0 !py-0 font-medium text-ui-base leading-5 shadow-none hover:border-transparent focus-visible:border-transparent focus-visible:bg-transparent focus-visible:ring-0",
+                    // Bugfix: 拒绝反馈自动换行，但限制为 5 行并在输入框内滚动，避免窄屏遮住权限选项和确认按钮。
+                    "h-auto !min-h-5 max-h-[5lh] min-w-0 max-w-full overflow-y-auto rounded-none border-transparent bg-transparent !px-0 !py-0 font-medium shadow-none hover:border-transparent focus-visible:border-transparent focus-visible:bg-transparent focus-visible:ring-0",
+                    resolveMobileInputTextSizeClassName({ avoidIosInputFocusZoom }),
                   )}
                 />
               </div>
@@ -893,11 +1071,11 @@ export function PermissionDialog({
           </div>
 
           {responseError ? (
-            <p role="alert" className="text-ui-base text-destructive">
+            <p role="alert" className="shrink-0 text-ui-base text-destructive">
               {responseError}
             </p>
           ) : null}
-          <div className="flex items-center justify-between gap-2 px-1">
+          <div className="flex shrink-0 items-center justify-between gap-2 px-1">
             <p className="flex gap-2 text-ui-base items-center text-foreground-subtle">
               <Info className="text-foreground size-4 shrink-0" />
               {intl.formatMessage({ id: "chat.permission.keyboardHint" })}
@@ -911,7 +1089,8 @@ export function PermissionDialog({
                 responding ||
                 (isFeedbackSelected
                   ? !feedback.trim()
-                  : orderedOptions[selectedIndex] === undefined)
+                  : orderedOptions[selectedIndex] === undefined ||
+                    isOptionBlocked(orderedOptions[selectedIndex]))
               }
               className="bg-brand text-foreground-inverse hover:bg-brand/80"
             >

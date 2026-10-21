@@ -17,6 +17,7 @@ import {
 import { buildProviderRequestMessages } from "./provider-request-messages.js";
 
 export { buildPostCompactReadStateReminderEntries } from "./compact-post-reminders.js";
+export type { CompactEntrySelection } from "./compact-selection.js";
 export { countCompactPreservedRuntimeMessages } from "./compact-preservation.js";
 export {
   estimateRuntimeEntryTokens,
@@ -27,9 +28,8 @@ export {
   selectCompactEntriesForInitialPromptTooLong,
   truncateCompactSummaryRequestEntriesAfterPromptTooLong,
 } from "./compact-selection.js";
-export type { CompactEntrySelection } from "./compact-selection.js";
 
-interface RuntimeMicrocompactResult {
+export interface RuntimeMicrocompactResult {
   decision: ReturnType<typeof maybeLocalMicrocompactMessages>["decision"];
   entries: readonly RuntimeMessageEntry[];
   payload?: ReturnType<typeof maybeLocalMicrocompactMessages>["payload"];
@@ -87,6 +87,21 @@ export function buildPostCompactRuntimeEntries(
   ];
 }
 
+export function getTrailingRuntimeUserEntries(
+  entries: readonly RuntimeMessageEntry[],
+): RuntimeMessageEntry[] {
+  const trailingEntries: RuntimeMessageEntry[] = [];
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry) continue;
+    if (!isRuntimeAttachmentEntry(entry) && entry.message.role !== "user") {
+      break;
+    }
+    trailingEntries.unshift(cloneRuntimeEntry(entry));
+  }
+  return trailingEntries;
+}
+
 export function maybeLocalMicrocompactRuntimeEntries(input: {
   config?: LocalMicrocompactPolicyConfig;
   entries: readonly RuntimeMessageEntry[];
@@ -94,15 +109,22 @@ export function maybeLocalMicrocompactRuntimeEntries(input: {
   nowMs?: number;
   useMidConversationSystem?: boolean;
 }): RuntimeMicrocompactResult {
-  const providerMessages = buildProviderRequestMessages({
+  const projection = buildProviderRequestMessages({
     entries: input.entries,
     applyCacheControl: false,
     useMidConversationSystem: input.useMidConversationSystem,
-  }).messages;
+  });
   const result = maybeLocalMicrocompactMessages({
     config: input.config,
     lastAssistantCompletedAtMs: input.lastAssistantCompletedAtMs,
-    messages: providerMessages,
+    messages: projection.messages,
+    // 候选分类读取权威目标身份，token 估算继续使用真实 provider 包装。
+    resolveToolResultName: (message, index) => {
+      const source = projection.sourceEntries[index];
+      return source && !isRuntimeAttachmentEntry(source)
+        ? source.message.toolName
+        : message.toolName;
+    },
     nowMs: input.nowMs,
   });
 

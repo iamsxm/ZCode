@@ -12,13 +12,18 @@ const { stageThirdPartyNotices } = await import(
 
 // tsup config 可能从不同 cwd 加载，基于配置文件自身目录解析仓库根 package.json。
 const rootPackageJsonPath = resolve(import.meta.dirname, "../../package.json");
-const { version } = JSON.parse(readFileSync(rootPackageJsonPath, "utf-8"));
+const { version, zcodeCompatibility } = JSON.parse(readFileSync(rootPackageJsonPath, "utf-8")) as {
+  version: string;
+  zcodeCompatibility?: { minCompatibleVersion?: string };
+};
+const minCompatibleVersion = zcodeCompatibility?.minCompatibleVersion ?? version;
 
 const { environment: zcodeEnv, content: zcodeBuiltinProviderConfigJson } =
   await loadBuiltinProviderConfig();
 
 export const SERVER_HTTP_DEFINES = {
   __ZCODE_VERSION__: JSON.stringify(version),
+  __ZCODE_MIN_COMPATIBLE_VERSION__: JSON.stringify(minCompatibleVersion),
   __ZCODE_ENV__: JSON.stringify(zcodeEnv),
   __ZCODE_BUILTIN_PROVIDER_CONFIG_JSON__: JSON.stringify(zcodeBuiltinProviderConfigJson),
 };
@@ -37,19 +42,24 @@ export const SERVER_HTTP_EXTERNAL_DEPENDENCIES = [
   "combined-stream",
   "proxy-from-env",
   "follow-redirects",
-  // node-forge 内部用动态 require("crypto")，内联进 server ESM bundle 后 Node 会报
+  "yazl",
+  // Bugfix: node-forge 内部用动态 require("crypto")，内联进 server ESM bundle 后 Node 会报
   // Dynamic require of "crypto" is not supported；这里和 desktop main/host 构建保持同一外置策略。
   "node-forge",
   "yaml",
   // services 的反馈日志压缩链路引入 CJS 包 yazl，被内联进 ESM bundle 后
   // 运行时命中 require("fs") 动态 require，entry-http 启动即崩；保留外部依赖交给 Node 原生加载。
   "yazl",
-  // 云内容 ZIP 解包链路引入 yauzl，其 CommonJS require("fs") 在 ESM
-  // bundle 加载时崩溃；与 desktop 相同，外置后交给 Node 原生加载。
+  // Bugfix: node-forge（appCaCert 自签 CA 链路）内部动态 require("crypto")，
+  // 与 desktop tsup.config 的处理一致，必须外置交给 Node 原生加载。
+  "node-forge",
+  // 修复：云内容 ZIP 解包链路（services/cloud-content）引入 CJS 包 yauzl，内联进 ESM bundle 后
+  // entry-http.js 加载即报 Dynamic require of "fs" is not supported；与 desktop 相同，外置交给 Node 原生加载。
   "yauzl",
 ];
 
 export default defineConfig({
+  // HTTP server 产物外置并内联第三方代码，dist 旁必须附带完整声明（Web/统一分发包直接复制 dist）。
   onSuccess: async () => {
     await stageThirdPartyNotices(resolve(import.meta.dirname, "dist"));
   },
@@ -57,6 +67,8 @@ export default defineConfig({
   outDir: "dist",
   format: "esm",
   platform: "node",
+  // node:sqlite 只有带前缀的内置入口；tsup 去掉 node: 会错误加载第三方 sqlite 包。
+  removeNodeProtocol: false,
   target: "node22",
   // workspace 包的 exports 指向 .ts 源码，node 运行时无法直接加载，需要 bundle 进来
   noExternal: [

@@ -22,7 +22,6 @@ import { modelRequestTokenLimitLogContext } from "./model-token-limits.js";
 import { createModelStreamingEventQueue } from "./model-streaming-event-queue.js";
 import { getOrCreateReasoningBlock } from "./reasoning-stream.js";
 import { createRefreshRuntimeHeadersBeforeModelAttempt } from "./model-runtime-headers.js";
-import { resolveModelRequestSessionTypeFromTaskType } from "./model-request-session-type.js";
 import { isOutputTokenLimitFinishReason } from "./turn-output-token-continuation.js";
 
 const TOOL_INPUT_STREAM_DELTA_FALLBACK_FLUSH_CHARS = 4096;
@@ -79,8 +78,8 @@ export async function runModelTextRequest(
   // 任务预算；adapter 只做 provider 兼容映射，不再施加独立 global cap。
   const modelInvocationContext = {
     metadata: traceContextToLogContext(projectedOptions.traceContext),
-    modelRequestSessionType: resolveModelRequestSessionTypeFromTaskType(this.config.taskType),
-    // 重试预算与准入端口不在这里设：它们是 runtime 层字段，由 createRuntimeModel 绑在句柄上，turn step 与工具内部的模型调用同一来源。
+    // 会话类型、重试预算与准入端口由 createRuntimeModel 绑在句柄上
+    // turn step 与工具内部的模型调用同一来源。
     modelCall: {
       // 普通 Agent Step 以前只靠 metadata.querySource 在 Adapter 中反推
       // operation/actor；元数据一旦改名或缺失，就会误记为 tool_internal_model_call。
@@ -119,6 +118,7 @@ export async function runModelTextRequest(
   const modelRequest = {
     messages: projectedOptions.messages,
     tools: projectedOptions.tools,
+    toolSearchEnabled: projectedOptions.toolSearchEnabled,
     abortSignal: projectedOptions.abortSignal,
     ...(projectedOptions.maxOutputTokens !== undefined
       ? { options: { maxOutputTokens: projectedOptions.maxOutputTokens } }
@@ -329,6 +329,8 @@ export async function runModelTextRequest(
           break;
         }
 
+        // 原始参数流保留包装结构；目标身份由公共准入产生，再通过工具事件交给展示投影。
+        // 不从参数 delta 推测执行目标，也不为展示身份调整模型流或工具调度时序。
         case "tool_input_start": {
           const toolCallId = event.id as ToolCallId;
           toolInputDeltaBuffers.delete(toolCallId);

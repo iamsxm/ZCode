@@ -6,52 +6,53 @@ import type { RuntimeInputPresentation } from "../interfaces/runtime-input-prese
 // ============================================================
 
 import type {
+  CompactBoundaryPayload,
+  CompactTimelinePayload,
+  MicrocompactBoundaryPayload,
+} from "../compact/index.js";
+import type { HookRunLifecyclePayload } from "../hooks/index.js";
+import type { HttpClientEgressInfo } from "../interfaces/http-client.port.js";
+import type { PermissionOptionsPolicy, PermissionUpdate } from "../interfaces/permission.port.js";
+import type {
+  MessageVisibility,
+  SessionTitleSource,
+  SyntheticUserMessageSource,
+} from "../interfaces/session-store.port.js";
+import type {
+  CollaborationMode,
+  HighspeedMessageMetadata,
+  RiskLevel,
+  TurnInputIntentMetadata,
+  TurnSteerCommandKind,
+  TurnSteerDeliveryMode,
+  TurnSteerRejectReason,
+  TurnSteerSource,
+} from "../interfaces/session.port.js";
+import type {
   EventId,
   InteractionRequestOrigin,
   MessageId,
   PartId,
   QueryId,
   SessionId,
-  TraceId,
   ToolCallId,
+  TraceId,
   TurnId,
 } from "../interfaces/shared.js";
-import type {
-  CollaborationMode,
-  RiskLevel,
-  TurnSteerCommandKind,
-  TurnSteerDeliveryMode,
-  TurnSteerRejectReason,
-  TurnSteerSource,
-  TurnInputIntentMetadata,
-} from "../interfaces/session.port.js";
 import type {
   ModelNetworkStatusEvent,
   ModelSelection,
   ModelUsage,
   ModelUsageSummary,
 } from "../model/index.js";
-import type { HttpClientEgressInfo } from "../interfaces/http-client.port.js";
 import { createModelUsageSummary } from "../model/index.js";
-import type { ModelApiErrorPhase, ModelFailureExceptionKind } from "../telemetry/index.js";
-import type {
-  CompactBoundaryPayload,
-  CompactTimelinePayload,
-  MicrocompactBoundaryPayload,
-} from "../compact/index.js";
-import type { HookRunLifecyclePayload } from "../hooks/index.js";
 import type { CheckpointCreatedPayload, RewindTriggeredPayload } from "../rewind/index.js";
-import type { GoalCompletionVerificationOutput, SessionGoal } from "../tools/target.js";
-import type { ToolSideEffectScope } from "../tools/contract.js";
-import type { ToolResultDisplayPayload } from "../tools/tool-result-metadata.js";
 import type { SkillTelemetryMetadata } from "../skills/index.js";
-import type {
-  MessageVisibility,
-  SessionTitleSource,
-  SyntheticUserMessageSource,
-} from "../interfaces/session-store.port.js";
+import type { ModelApiErrorPhase, ModelFailureExceptionKind } from "../telemetry/index.js";
+import type { ToolSideEffectScope } from "../tools/contract.js";
 import type { SavedWorkflowScope } from "../tools/saved-workflow.js";
-import type { PermissionOptionsPolicy, PermissionUpdate } from "../interfaces/permission.port.js";
+import type { GoalCompletionVerificationOutput, SessionGoal } from "../tools/target.js";
+import type { ToolResultDisplayPayload } from "../tools/tool-result-metadata.js";
 import type {
   StreamRecoveryAnchorPayload,
   StreamRecoveryAnchorSelectedPayload,
@@ -111,9 +112,13 @@ export const SessionEventType = {
   UserMessage: "user_message",
   AssistantMessage: "assistant_message",
   AssistantFeedbackUpdated: "assistant_feedback_updated",
+  HighspeedMetricsUpdated: "highspeed_metrics_updated",
+  // （2026-09-12）：原 ToolWidgetStateUpdated / SessionPluginUiStateUpdated 已删除，
+  // 插件 UI widgetState 回退 renderer 内存，不再经 CLI 事件流。
   SystemMessage: "system_message",
   ModelRequest: "model_request",
   ModelSelected: "model_selected",
+  TurnExecutionModelFallback: "turn_execution_model_fallback",
   ModelStreaming: "model_streaming",
   StreamingToolLedgerUpdated: "streaming_tool_ledger_updated",
   StreamRecoveryAnchorCreated: "stream_recovery_anchor_created",
@@ -144,6 +149,12 @@ export const SessionEventType = {
   PermissionRequested: "permission_requested",
   PermissionResolved: "permission_resolved",
   PermissionDenied: "permission_denied",
+  // 插件 UI 订阅的 MCP 资源变化。只进 live 投影（v4Gateway.ingest，seq 0），不落盘、不进冷恢复。
+  PluginUiResourceUpdated: "plugin_ui_resource_updated",
+  PluginUiResourceListChanged: "plugin_ui_resource_list_changed",
+  /** App-Provided Tools：模型发起的页面工具调用，只进 live 投影（实例信箱），不落盘。 */
+  PluginUiInstanceClosed: "plugin_ui_instance_closed",
+  PluginUiAppToolCallRequested: "plugin_ui_app_tool_call_requested",
   UserInputAutoResolutionUpdated: "user_input_auto_resolution_updated",
   WorkspaceHookReviewRequested: "workspace_hook_review_requested",
   WorkspaceHookReviewSettled: "workspace_hook_review_settled",
@@ -278,6 +289,24 @@ export type WorkflowNotificationMeta =
       context?: string;
       askedAt?: number;
     }
+  /**
+   * 脚本到达一处留白（docs/dynamic-workflow/transcript-and-notifications.md 的 `hole` 载荷）：
+   * 主代理欠这个 run 一段代码。`prompt` ≤4000（与升级问题同界）；`before` / `after` 是留白前后
+   * 的阶段名，`draftPath` / `line` 指向 run 草稿里的那一行。每个 `hole-reached` 恰好一条。
+   */
+  | {
+      kind: "hole";
+      siteId: string;
+      ordinal: number;
+      name: string;
+      type: string;
+      prompt?: string;
+      draftPath?: string;
+      line?: number;
+      before?: string;
+      after?: string;
+      reachedAt?: number;
+    }
   /** run 级停滞：每个 stall 段一条，不是终态。 */
   | {
       kind: "stall";
@@ -285,6 +314,20 @@ export type WorkflowNotificationMeta =
       reason?: string;
       cap?: number;
     };
+
+/**
+ * 主代理闲着、run 还欠着决定时的提醒：每个 run 一条，带发出那一刻开着的问题数、等着的留白数与
+ * 其中最久的等待。不是 run 事件——由父会话的空闲钟发出。
+ *
+ * 它是 originMeta 上独立的键，不是 WorkflowNotificationMeta 的成员：那个 union 在线上是闭集，多一个
+ * kind 会让不认识它的客户端拒掉整帧、打不开会话；不认识的键只是被剥掉
+ * （docs/dynamic-workflow/transcript-and-notifications.md「The payload」）。
+ */
+export interface WorkflowBlockedMeta {
+  questions: number;
+  holes: number;
+  sinceMs: number;
+}
 
 /** 独立后台结果轮的展示元信息；批量轮可复用代表任务身份并合成 title，不从通知文本反向解析。 */
 export interface BackgroundResultOriginMeta {
@@ -294,6 +337,8 @@ export interface BackgroundResultOriginMeta {
   title: string;
   /** 只在 backgroundSource === "workflow" 的单条通知轮上在场；manifest 渲染的唯一数据源。 */
   workflowNotification?: WorkflowNotificationMeta;
+  /** 空闲提醒的载荷；与 workflowNotification 至多在场一个。 */
+  workflowBlocked?: WorkflowBlockedMeta;
 }
 
 /**
@@ -325,15 +370,16 @@ export type TurnBackgroundAttribution =
 export type WorkflowLaunchDisplay = Extract<ToolResultDisplayPayload, { kind: "create_workflow" }>;
 
 /**
- * 设置轮的「改了什么」：只有改动过的设置在场，
- * 每项 from / to 缺一端即那一端是默认（模型 = 会话模型，上限 = 本机上限）。`ceiling` 是本机上限，
- * 供「13 → 4」这种读法。与 shared 的 `workflowSettingsAmendMetaSchema` 同形。
+ * 设置轮（docs/dynamic-workflow/launch.md「The settings turn」）的「改了什么」：只有改动过的设置在场，
+ * 每项 from / to 缺一端即那一端是默认（模型 = 会话模型，上限 = 默认并发）。`ceiling` 是默认并发 D
+ * （线上键名早于「默认并发」这个概念，为兼容旧端保留），供「默认 13 → 4」这种读法。与 shared 的 `workflowSettingsAmendMetaSchema` 同形。
  */
 export interface WorkflowSettingsAmendMeta {
   /**
-   * 被这次调整替代（或接着跑）的那个 run。**缺席即就地生效**：只改并发上界、run 又还在飞时，
+   * 被这次调整替代（或接着跑）的那个 run。**缺席即就地生效**
+   * （docs/dynamic-workflow/launch.md「The settings turn」）：只改并发上界、run 又还在飞时，
    * 那次「配置」既不停这次 run 也不另起一次，于是没有前驱可指——`runId` 指的就是被调整的那一个。
-   * 与 shared 的 `workflowSettingsAmendMetaSchema` 同形。
+   * 与 shared 的 `workflowSettingsAmendMetaSchema` 同形（那边记着老桌面上的偏斜）。
    */
   predecessorRunId?: string;
   subagentModel?: { from?: string; to?: string };
@@ -625,6 +671,11 @@ export interface AssistantFeedbackUpdatedPayload {
   feedback: "like" | "dislike" | null;
 }
 
+export interface HighspeedMetricsUpdatedPayload {
+  entityId: string;
+  highspeed: HighspeedMessageMetadata;
+}
+
 export interface SystemMessagePayload {
   type: "init" | "compact_boundary" | "interrupted";
   content: string;
@@ -691,6 +742,26 @@ export interface ModelSelectedPayload {
   supportedThoughtLevels?: string[];
   /** 当前 selection 在 runtime 实际应用的上下文窗口；null 表示显式清除，字段缺失兼容旧事件。 */
   contextWindow?: number | null;
+}
+
+/**
+ * 执行 Selection 退回会话 Selection 的原因，与 @zcode/shared 的 selectionFallback 规则同值域：
+ * 卡过期由声明的 provider 错误码命中，其余任何加速请求失败归为 request_failed。
+ */
+export type TurnExecutionModelFallbackReason =
+  | "highspeed_card_expired"
+  | "highspeed_request_failed"
+  | "highspeed_selection_unavailable";
+
+export interface TurnExecutionModelFallbackPayload {
+  inputId?: string;
+  reason: TurnExecutionModelFallbackReason;
+  /**
+   * Provider 重构后单轮执行模型统一用稀疏 Selection 表达（旧的 ModelRef 已删除）：
+   * from 是本轮 execution 作用域的加速 Selection，to 是会话常驻 Selection。
+   */
+  fromModelSelection: ModelSelection;
+  toModelSelection: ModelSelection;
 }
 
 export type ModelStreamingKind =
@@ -849,6 +920,10 @@ export interface ToolCallProgressPayload {
   toolCallId: ToolCallId;
   toolName?: string;
   elapsedMs?: number;
+  /** MCP `notifications/progress`（A8）：progress / total / message 原样转发。 */
+  progress?: number;
+  total?: number;
+  message?: string;
   pid?: number;
   stdoutBytes?: number;
   stderrBytes?: number;
@@ -864,6 +939,8 @@ export interface ToolCallResultPayload {
   duration: number;
   /** Skill metadata 仅用于 telemetry，不进入模型可见的 result.content。 */
   skillMetadata?: SkillTelemetryMetadata;
+  /** 执行时 ToolEntry 的插件归属，不从工具名称推断。 */
+  pluginId?: string;
 }
 
 export interface ToolCallErrorPayload {
@@ -871,6 +948,8 @@ export interface ToolCallErrorPayload {
   error: ErrorPayload;
   /** Skill metadata 仅用于 telemetry，不进入模型可见的错误正文。 */
   skillMetadata?: SkillTelemetryMetadata;
+  /** 执行时 ToolEntry 的插件归属，不从工具名称推断。 */
+  pluginId?: string;
 }
 
 export interface ToolBatchCompletePayload {
@@ -954,6 +1033,7 @@ export interface DynamicWorkflowRunProgressPayload {
 }
 
 export interface PermissionRequestedPayload {
+  approvalMode?: "user-once";
   requestId?: string;
   toolCallId: ToolCallId;
   toolName: string;
@@ -969,6 +1049,35 @@ export interface PermissionRequestedPayload {
   display?: ToolResultDisplayPayload;
   fullAccessSupported?: boolean;
   optionsPolicy?: PermissionOptionsPolicy;
+}
+
+/** 订阅者以 (scopeId, generation) 标识沙箱实例；renderer 只投递给 generation 一致的实例。 */
+export interface PluginUiResourceSubscriberRef {
+  instance: import("@zcode/shared/mcp-apps").McpAppInstance;
+  scopeId: string;
+  generation: number;
+}
+export interface PluginUiResourceUpdatedPayload {
+  pluginId: string;
+  serverName: string;
+  uri: string;
+  subscribers: PluginUiResourceSubscriberRef[];
+}
+export interface PluginUiResourceListChangedPayload {
+  pluginId: string;
+  serverName: string;
+  subscribers: PluginUiResourceSubscriberRef[];
+}
+/** App-Provided Tools：一次待执行的页面工具调用，投递给 subscribers 里唯一的实例。 */
+export interface PluginUiAppToolCallRequestedPayload {
+  activity?: boolean;
+  cancelled?: boolean;
+  pluginId: string;
+  serverName: string;
+  subscribers: PluginUiResourceSubscriberRef[];
+  callId: string;
+  toolName: string;
+  arguments: Record<string, unknown>;
 }
 
 export interface PermissionResolvedPayload {
@@ -1126,6 +1235,13 @@ export interface ErrorAttribution {
   statusCode?: number;
   providerErrorCode?: string;
   retryable?: boolean;
+  /** string=使用该 Highspeed 卡，null=明确未使用，undefined=旧 Agent 未发布。 */
+  highspeedCardId?: string | null;
+  /**
+   * true=本轮 Highspeed 创建期或请求期失败已命中退回声明，但所有退回目标都无法创建，整轮按真实错误
+   * 结束。Renderer 据此作废匹配卡；不再按错误码推断，请求期 3402/网络失败的 code 是 provider 错误码。
+   */
+  highspeedFallbackUnavailable?: boolean;
 }
 
 // CollaborationMode and RiskLevel are re-exported from ports
@@ -1162,6 +1278,11 @@ export function createModelUsageSummaryFromEvents(
   const usages: ModelUsage[] = [];
 
   for (const event of events) {
+    if (event.type === SessionEventType.ModelNetworkStatus) {
+      const payload = event.payload as ModelNetworkStatusEvent;
+      // 成功请求由 ModelComplete 计入；只补充失败请求的已报告用量，避免双计。
+      if (payload.type === "model_request_failed" && payload.usage) usages.push(payload.usage);
+    }
     if (event.type !== SessionEventType.ModelComplete) continue;
     const payload = event.payload as Partial<ModelCompletePayload>;
     if (payload.usage) {
@@ -1198,6 +1319,7 @@ export type SessionEventPayload =
   | SystemMessagePayload
   | ModelRequestPayload
   | ModelSelectedPayload
+  | TurnExecutionModelFallbackPayload
   | ModelStreamingPayload
   | StreamingToolLedgerPayload
   | StreamRecoveryAnchorPayload
@@ -1225,6 +1347,9 @@ export type SessionEventPayload =
   | PermissionRequestedPayload
   | PermissionResolvedPayload
   | PermissionDeniedPayload
+  | PluginUiResourceUpdatedPayload
+  | PluginUiResourceListChangedPayload
+  | PluginUiAppToolCallRequestedPayload
   | UserInputAutoResolutionUpdatedPayload
   | WorkspaceHookReviewRequestedPayload
   | WorkspaceHookReviewSettledPayload

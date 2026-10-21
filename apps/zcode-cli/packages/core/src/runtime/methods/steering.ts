@@ -4,6 +4,7 @@ import {
   recoverPendingPermissionGrant,
 } from "../permission-grant-recovery.js";
 import { runtimeInputMetadata } from "../../agent/runtime-input-presentation.js";
+import { withConversationQuotes } from "../helpers/conversation-quotes.js";
 import {
   CoreErrorType,
   SessionEventType,
@@ -30,6 +31,7 @@ import type {
   TurnId,
 } from "../deps.js";
 import { cloneModelSelection } from "../model-selection.js";
+import { acceptSubmissionModelSelection, recordPublishedModelSelection } from "./turn-model.js";
 import { createRuntimeModel } from "./runtime-model.js";
 import {
   buildUserContentFromTurn,
@@ -50,8 +52,12 @@ import {
 } from "../../agent/message-history.js";
 import type { AgentRuntimeInternal } from "../internal.js";
 
-function hasSteerInput(request: Pick<TurnSteerInput, "attachments" | "input">): boolean {
-  return request.input.trim().length > 0 || Boolean(request.attachments?.length);
+function hasSteerInput(request: Pick<TurnSteerInput, "attachments" | "input" | "intent">): boolean {
+  return (
+    request.input.trim().length > 0 ||
+    Boolean(request.attachments?.length) ||
+    Boolean(request.intent?.conversationQuotes?.length)
+  );
 }
 
 export async function steerTurn(
@@ -144,7 +150,21 @@ export async function steerTurn(
     ...(toolDisallowlist ? { toolDisallowlist } : {}),
     turnId: activeTurn.turnId,
   };
+  const selectionAccepted = acceptSubmissionModelSelection(
+    this,
+    intent,
+    activeTurn.traceContext,
+    request.modelSelectionScope
+      ? {
+          selectionScope: request.modelSelectionScope,
+          highspeedFallbackSelection: request.highspeedFallbackSelection,
+        }
+      : undefined,
+  );
   activeTurn.pendingInputs.push(pendingInput);
+  // 用户亲手 steer 进来的话（协调者 / 信箱 / 工具跟进也走这里，它们不算）：与 prompt 一样，给每个
+  // 欠着决定的 run 一对新的提醒。
+  if (request.inputPresentation === "user_steer") this.workflowBlockedReminder?.userSpoke();
   const queueLength = activeTurn.pendingInputs.length;
   const event = createSessionEvent(
     SessionEventType.TurnSteerQueued,
@@ -171,6 +191,7 @@ export async function steerTurn(
     },
   );
   await this.appendEvent(event, activeTurn.traceContext);
+  await selectionAccepted;
   this.logger?.debug("Turn steer queued", {
     ...traceContextToLogContext(activeTurn.traceContext),
     activeTurnKind: activeTurn.kind,
@@ -271,6 +292,17 @@ export async function enqueueDeferredInput(
     },
   );
   await this.appendEvent(event, traceContext);
+  await acceptSubmissionModelSelection(
+    this,
+    intent,
+    traceContext,
+    request.modelSelectionScope
+      ? {
+          selectionScope: request.modelSelectionScope,
+          highspeedFallbackSelection: request.highspeedFallbackSelection,
+        }
+      : undefined,
+  );
   this.logger?.debug("Deferred input queued", {
     ...traceContextToLogContext(traceContext),
     delivery,
@@ -868,7 +900,7 @@ export async function editPendingInputById(
         inputPreview: previewInput(options.newText),
         inputSize: measureUtf8Bytes(options.newText),
         ...(held.commandKind ? { commandKind: held.commandKind } : {}),
-        ...(held.intent ? { intent: held.intent } : {}),
+        ...(held.intent ? { intent: { ...held.intent, text: options.newText } } : {}),
         ...(held.toolDisallowlist ? { toolDisallowlist: held.toolDisallowlist } : {}),
         queueLength: projection.pendingSteerInputs.length,
         targetTurnId: held.targetTurnId,
@@ -883,6 +915,8 @@ export async function editPendingInputById(
   }
   await persistSessionInputUpdates(this, [{ id: pendingInput.id, text: options.newText }]);
   pendingInput.input = options.newText;
+  // 编辑正文后必须同步 canonical text，否则结构化引用恢复时会显示旧正文。
+  if (pendingInput.intent) pendingInput.intent = { ...pendingInput.intent, text: options.newText };
   const event = createSessionEvent(
     SessionEventType.TurnSteerQueued,
     this.sessionId,
@@ -1108,6 +1142,7 @@ export async function emitModelSelected(
     { traceId: options.traceContext.traceId },
   );
   await this.appendEvent(event, options.traceContext);
+  recordPublishedModelSelection(this, options.modelSelection);
 }
 
 /**
@@ -1214,7 +1249,14 @@ async function drainPendingInputUnlocked(
         ? parseRuntimeInputPresentation(pendingInput.inputPresentation)
         : undefined;
     const runtimeEntry = createRuntimeUserEntry(
-      buildUserContentFromTurn(pendingInput.input, resolvedAttachments),
+      buildUserContentFromTurn(
+        withConversationQuotes(
+          pendingInput.input,
+          pendingInput.intent?.conversationQuotes,
+          pendingInput.intent?.botGroupSource,
+        ),
+        resolvedAttachments,
+      ),
       runtimeInputMetadata(inputPresentation) ?? realUserRuntimeMetadata(),
     );
     this.messageHistory.addEntries([runtimeEntry]);

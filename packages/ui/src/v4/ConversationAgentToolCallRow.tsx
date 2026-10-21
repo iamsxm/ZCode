@@ -1,5 +1,5 @@
 import { useCallback, useMemo } from "react";
-import { TID_V4_ROW, TID_V4_SUBAGENT_OPEN_SIDE_PANE, testId } from "@zcode/shared";
+import { TID_V4_ROW, TID_V4_SUBAGENT_OPEN_SIDE_PANE, testId } from "@zcode/shared/test-ids";
 import { ToolCallBlock } from "@/ToolCallBlocks.js";
 import { getAgentPrimaryText } from "@/ToolCallBlocks/renderers/agentHelpers.js";
 import type { ConversationAssistantWorkRenderItem } from "@/v4/conversationAssistantWorkItems.js";
@@ -7,7 +7,7 @@ import type { ConversationRowRenderContext } from "@/v4/conversationRowContext.j
 import { toolCallRowToLegacyNode } from "@/v4/toolCallRowAdapter.js";
 import { runUserAction } from "@/lib/userActionTelemetry.js";
 
-function openSubagentSessionFromSummary({
+export function openSubagentSessionFromSummary({
   backgrounded: _backgrounded = false,
   childSessionId,
   context,

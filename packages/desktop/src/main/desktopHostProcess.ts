@@ -1,16 +1,6 @@
 import { ingestToolExecResource } from "./desktopResourceTelemetry.js";
 import { ingestMcpResourceSamples } from "./processResourceMcpTelemetrySource.js";
 /* eslint-disable max-lines -- host process 统一处理 main↔host 生命周期、日志、ZCode Agent，拆分前先保持跨进程消息收口。 */
-import { bindDatabaseStartupRelay } from "./databaseStartupRelay.js";
-import { randomUUID } from "node:crypto";
-import { join } from "node:path";
-import {
-  app,
-  BrowserWindow,
-  MessageChannelMain,
-  utilityProcess as electronUtilityProcess,
-} from "electron";
-import type { MessagePortMain, UtilityProcess as ElectronUtilityProcess } from "electron";
 import {
   type HostAgentProcessErrorResponse,
   type HostAgentProcessExceptionResponse,
@@ -20,40 +10,58 @@ import {
   type HostCuaOperationStateResponse,
   type HostMcpTelemetryResponse,
   type HostSessionCreateTelemetryResponse,
+  type HostPluginTelemetryResponse,
+  type RemoteTarget,
   type TaskRealtimeHostDeliveryKind,
+  type WorkspacePurpose,
   formatZCodeHostProcessName,
   HostMessageTypes,
-  HostResponseTypes,
   hostResponseMessageSchema,
+  HostResponseTypes,
   InternalChannels,
   LAUNCH_MARKS_QUERY_KEY,
   RUNTIME_ZCODE_DEBUG,
   serializeLaunchMarks,
-  type RemoteTarget,
-  type WorkspacePurpose,
   ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED_ENV,
 } from "@zcode/shared";
-import { getMainLaunchPartialMarks } from "./desktopLaunchMarks.js";
+import type {
+  PluginSandboxHandle,
+  PluginSandboxRegisterRequestPayload,
+  PluginSandboxRegisterResultPayload,
+} from "@zcode/shared/mcp-apps";
+import type { UtilityProcess as ElectronUtilityProcess, MessagePortMain } from "electron";
+import {
+  app,
+  BrowserWindow,
+  utilityProcess as electronUtilityProcess,
+  MessageChannelMain,
+} from "electron";
+import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { BroadcastHub } from "./broadcastHub.js";
-import type { TaskRealtimeBus } from "./taskRealtimeBus.js";
+import { bindDatabaseStartupRelay } from "./databaseStartupRelay.js";
+import { getMainLaunchPartialMarks } from "./desktopLaunchMarks.js";
+import { ingestHostNetworkObservations } from "./desktopNetworkTelemetry.js";
+import {
+  buildHostProcessEnv,
+  hostModulePath,
+  resolveBundledGlmBinaryPath,
+} from "./desktopRuntimeEnv.js";
+import { ingestHostNetworkCapture } from "./resourceManagerNetwork.js";
+import { buildHostE2ECoverageEnv } from "./e2eCoverage.js";
+import { createFeedbackLogArchiveFromExportLogs } from "./exportLogs.js";
 import { createHostLogRelay } from "./hostLogRelay.js";
+import { ingestCliResourceSample } from "./processResourceCliSource.js";
+import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
+import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
 import {
   registerHostAgentProcess,
   registerHostProcess,
   unregisterHostAgentProcess,
   unregisterHostProcess,
 } from "./resourceManagerWindow.js";
-import { resolveHostResourceUsageResult } from "./resourceManagerHostSampling.js";
-import {
-  buildHostProcessEnv,
-  hostModulePath,
-  resolveBundledGlmBinaryPath,
-} from "./desktopRuntimeEnv.js";
-import { ingestHostNetworkObservations } from "./desktopNetworkTelemetry.js";
-import { ingestCliResourceSample } from "./processResourceCliSource.js";
-import { ingestHostSelfResourceSample } from "./processResourceSelfHeapSource.js";
-import { createFeedbackLogArchiveFromExportLogs } from "./exportLogs.js";
-import { buildHostE2ECoverageEnv } from "./e2eCoverage.js";
+import type { RemoteAssetDirs } from "./desktopRuntimeEnv.js";
+import type { TaskRealtimeBus } from "./taskRealtimeBus.js";
 
 export interface WindowBootstrapOptions {
   restoreSession?: boolean;
@@ -79,13 +87,14 @@ export interface HostInitMessage {
     workspaceIdentity?: string;
   }>;
   agentSpawnFallbackCwd?: string;
+  remoteAssets?: RemoteAssetDirs;
   /** Main 解析后的 ZCode Built-in Provider Config 路径；Host/Services 不感知 Electron 安装布局。 */
   zcodeBuiltinProviderConfigFilePath: string;
   /** Main 提前异步采集并过滤的本机 runtime 环境；只允许传给 InitLocal。 */
   runtimeProcessEnvPatch?: Record<string, string>;
 }
 
-interface SpawnHostProcessOptions {
+export interface SpawnHostProcessOptions {
   internalChannel?: typeof InternalChannels.ServicePort | typeof InternalChannels.ScopedServicePort;
   internalPayload?: unknown;
   registerBroadcast?: boolean;
@@ -178,33 +187,13 @@ export function spawnHostProcess(
     onAgentProcessReady?: (event: HostAgentProcessReadyResponse) => void;
     onAgentProcessSpawned?: (event: HostAgentProcessSpawnedResponse) => void;
     onMcpTelemetry?: (event: HostMcpTelemetryResponse) => void;
+    onPluginTelemetry?: (event: HostPluginTelemetryResponse) => void;
     onSessionCreateTelemetry?: (event: HostSessionCreateTelemetryResponse) => void;
     onCuaOperationStateChanged?: (
       source: ElectronUtilityProcess,
       event: HostCuaOperationStateResponse,
     ) => void;
     onCuaOperationStateSourceExited?: (source: ElectronUtilityProcess) => void;
-    handleBotRemoteWorkspaceReconnectRequest?: (params: {
-      win: BrowserWindow;
-      requestId: string;
-      workspacePath: string;
-      workspaceIdentity: string;
-      target: RemoteTarget;
-    }) => Promise<{ ok: boolean; sessionId?: string; error?: string }>;
-    handleBotRemoteWorkspaceConnectionStatusRequest?: (params: {
-      win: BrowserWindow;
-      requestId: string;
-      workspacePath: string;
-      workspaceIdentity: string;
-      target: RemoteTarget;
-    }) => Promise<{ ok: boolean; connected?: boolean; error?: string }>;
-    handleBotRemoteWorkspaceRuntimePortRequest?: (params: {
-      win: BrowserWindow;
-      requestId: string;
-      workspacePath: string;
-      workspaceIdentity: string;
-      target: RemoteTarget;
-    }) => Promise<{ ok: boolean; port?: MessagePortMain; error?: string }>;
     /** host → main：定时任务派发结果，转交给 cron scheduler 结算调度状态机。 */
     onCronRunResult?: (result: {
       runId: string;
@@ -218,6 +207,7 @@ export function spawnHostProcess(
     onOffPeakRunResult?: (result: {
       offPeakTaskId: string;
       ok: boolean;
+      lifecycleManaged?: true;
       conversationId?: string;
       sessionId?: string;
       error?: string;
@@ -245,6 +235,10 @@ export function spawnHostProcess(
     }) => Promise<{ ok: boolean; [k: string]: unknown }>;
     /** Host 已完成附件授权后，由 Main 将本地视频 realpath 加入精确协议授权集合。 */
     authorizeLocalMediaPreviewPath?: (path: string) => Promise<string>;
+    /** Host 校验完插件 UI HTML 后交给 Main 沙箱注册表登记，返回句柄。 */
+    registerPluginSandbox?: (
+      input: PluginSandboxRegisterRequestPayload,
+    ) => PluginSandboxHandle | Promise<PluginSandboxHandle>;
   },
   options?: SpawnHostProcessOptions,
 ): ElectronUtilityProcess {
@@ -322,7 +316,10 @@ export function spawnHostProcess(
       ingestHostNetworkObservations(result.data.observations);
       return;
     }
-
+    if (result.data.type === HostResponseTypes.NetworkCaptureBatch) {
+      ingestHostNetworkCapture(result.data.batch, child.pid ?? 0);
+      return;
+    }
     // CLI 自采的 60 秒样本：按 services 打的 lane 归入 cli_chat / cli_aux 角色。
     if (result.data.type === HostResponseTypes.AgentResourceSample) {
       ingestCliResourceSample(
@@ -363,6 +360,11 @@ export function spawnHostProcess(
       return;
     }
 
+    if (result.data.type === HostResponseTypes.PluginTelemetry) {
+      dependencies.onPluginTelemetry?.(result.data);
+      return;
+    }
+
     if (result.data.type === HostResponseTypes.SessionCreateTelemetry) {
       dependencies.onSessionCreateTelemetry?.(result.data);
       return;
@@ -397,6 +399,32 @@ export function spawnHostProcess(
             error: error instanceof Error ? error.message : String(error),
           });
         });
+      return;
+    }
+
+    if (result.data.type === HostResponseTypes.PluginSandboxRegisterRequest) {
+      const request = result.data;
+      const register = dependencies.registerPluginSandbox;
+      const reply = (payload: PluginSandboxRegisterResultPayload) =>
+        child.postMessage({ type: HostMessageTypes.PluginSandboxRegisterResult, ...payload });
+      if (!register || win.isDestroyed() || request.ownerWebContentsId !== win.webContents.id) {
+        reply({
+          requestId: request.requestId,
+          ok: false,
+          error: "Plugin UI sandbox is unavailable.",
+        });
+        return;
+      }
+      void Promise.resolve()
+        .then(() => register(request))
+        .then((handle) => reply({ requestId: request.requestId, ok: true, ...handle }))
+        .catch((error: unknown) =>
+          reply({
+            requestId: request.requestId,
+            ok: false,
+            error: error instanceof Error ? error.message : String(error),
+          }),
+        );
       return;
     }
 
@@ -527,6 +555,7 @@ export function spawnHostProcess(
       dependencies.onOffPeakRunResult?.({
         offPeakTaskId: result.data.offPeakTaskId,
         ok: result.data.ok,
+        lifecycleManaged: result.data.lifecycleManaged,
         conversationId: result.data.conversationId,
         sessionId: result.data.sessionId,
         error: result.data.error,
@@ -563,140 +592,6 @@ export function spawnHostProcess(
         workspaceIdentity: result.data.workspaceIdentity,
         runningTaskCount: result.data.runningTaskCount,
       });
-      return;
-    }
-
-
-    if (result.data.type === HostResponseTypes.BotRemoteWorkspaceReconnectRequest) {
-      const request = result.data;
-      const handler = dependencies.handleBotRemoteWorkspaceReconnectRequest;
-      if (!handler) {
-        child.postMessage({
-          type: HostMessageTypes.BotRemoteWorkspaceReconnectResult,
-          requestId: request.requestId,
-          ok: false,
-          // Bugfix: /reconnect 需要 main 侧 bridge，缺 handler 时返回明确原因，避免继续显示笼统的不可访问。
-          error: "未注入 Bot 远端 workspace 重连处理器。",
-        });
-        return;
-      }
-
-      void handler({
-        win,
-        requestId: request.requestId,
-        workspacePath: request.workspacePath,
-        workspaceIdentity: request.workspaceIdentity,
-        target: request.target,
-      })
-        .then((reconnectResult) => {
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceReconnectResult,
-            requestId: request.requestId,
-            ok: reconnectResult?.ok === true,
-            sessionId: reconnectResult?.sessionId,
-            error: reconnectResult?.error,
-          });
-        })
-        .catch((error) => {
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceReconnectResult,
-            requestId: request.requestId,
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      return;
-    }
-
-    if (result.data.type === HostResponseTypes.BotRemoteWorkspaceConnectionStatusRequest) {
-      const request = result.data;
-      const handler = dependencies.handleBotRemoteWorkspaceConnectionStatusRequest;
-      if (!handler) {
-        child.postMessage({
-          type: HostMessageTypes.BotRemoteWorkspaceConnectionStatusResult,
-          requestId: request.requestId,
-          ok: false,
-          error: "未注入 Bot 远端 workspace 连接状态处理器。",
-        });
-        return;
-      }
-
-      void handler({
-        win,
-        requestId: request.requestId,
-        workspacePath: request.workspacePath,
-        workspaceIdentity: request.workspaceIdentity,
-        target: request.target,
-      })
-        .then((statusResult) => {
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceConnectionStatusResult,
-            requestId: request.requestId,
-            ok: statusResult?.ok === true,
-            connected: statusResult?.connected,
-            error: statusResult?.error,
-          });
-        })
-        .catch((error) => {
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceConnectionStatusResult,
-            requestId: request.requestId,
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
-      return;
-    }
-
-    if (result.data.type === HostResponseTypes.BotRemoteWorkspaceRuntimePortRequest) {
-      const request = result.data;
-      const handler = dependencies.handleBotRemoteWorkspaceRuntimePortRequest;
-      if (!handler) {
-        child.postMessage({
-          type: HostMessageTypes.BotRemoteWorkspaceRuntimePort,
-          requestId: request.requestId,
-          ok: false,
-          // Bugfix: 远端 Bot 不能在缺少 runtime bridge 时回落到本地 ZCode Agent，
-          // 否则会把 remote workspace 的任务写到本地并触发错误模型。
-          error: "未注入 Bot 远端 workspace runtime 处理器。",
-        });
-        return;
-      }
-
-      void handler({
-        win,
-        requestId: request.requestId,
-        workspacePath: request.workspacePath,
-        workspaceIdentity: request.workspaceIdentity,
-        target: request.target,
-      })
-        .then((runtimeResult) => {
-          if (runtimeResult.ok && runtimeResult.port) {
-            child.postMessage(
-              {
-                type: HostMessageTypes.BotRemoteWorkspaceRuntimePort,
-                requestId: request.requestId,
-                ok: true,
-              },
-              [runtimeResult.port],
-            );
-            return;
-          }
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceRuntimePort,
-            requestId: request.requestId,
-            ok: false,
-            error: runtimeResult.error ?? "unknown",
-          });
-        })
-        .catch((error) => {
-          child.postMessage({
-            type: HostMessageTypes.BotRemoteWorkspaceRuntimePort,
-            requestId: request.requestId,
-            ok: false,
-            error: error instanceof Error ? error.message : String(error),
-          });
-        });
       return;
     }
   });

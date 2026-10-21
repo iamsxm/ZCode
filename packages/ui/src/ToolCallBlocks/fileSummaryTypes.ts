@@ -1,4 +1,5 @@
-import type { ReactNode } from "react";
+import type { PluginUiToolBinding } from "@/plugin-ui/contract.js";
+import type { ComponentType, ReactNode } from "react";
 import type { WorkflowRunState } from "@zcode/shared/zcode-protocol-v4";
 import type { MessageFileLinkTarget } from "@/components/ai-elements/message.js";
 import type { CodePreviewSettings } from "@/lib/codePreviewSettings.js";
@@ -8,6 +9,12 @@ import type { TaskChatToolCallTreeNode } from "@/lib/toolCallTree.js";
 import type { ToolDisplayModel } from "@/lib/toolDisplay.js";
 import type { Theme } from "@/useTheme.js";
 import type { OpenPlanDetailSideTabRequest } from "@/lib/workspaceSidePane.js";
+// Bugfix：这里曾写成类型位置的内联动态 import 写法（在 typeof 后跟圆括号包模块名）。
+// TS 编译期会擦除它，但 share 闭包守卫（shareBuildBoundary.test）的动态 import 正则
+// 不区分类型/值与注释，把它当成值导入后，整个 ToolCallBlocks.tsx 大桶（含 plugin-ui
+// 桶 → services/provider）被误判进 web-share 闭包。顶层 import type 同样不产生运行时
+// 边，且能被守卫正确跳过。注释里也不要出现该字面写法，正则同样会命中注释文本。
+import type { ToolCallBlock } from "@/ToolCallBlocks.js";
 
 export function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -201,9 +208,15 @@ export interface WorkflowDraftPosition {
 }
 
 export interface ToolCallBlockRenderContext {
+  nestedToolRenderer: ComponentType<Parameters<typeof ToolCallBlock>[0]>;
   isOfficeMode?: boolean;
   toolCallNode: TaskChatToolCallTreeNode;
   workspacePath: string;
+  /**
+   * 插件 UI：scope 是沙箱登记需要的 session 范围，onOpenSidePane 是"在侧栏打开"回调；
+   * 由 PluginUiSessionProvider 在边界注入。缺省表示宿主不提供，带 ui:// 资源的工具回退普通 MCP 卡片。
+   */
+  pluginUi?: PluginUiToolBinding;
   /**
    * 应用主题（store 耦合剥离）：由构建 render context 的宿主
    * （ToolCallBlock / PermissionDialog 等）从上层状态传入，供
@@ -217,6 +230,8 @@ export interface ToolCallBlockRenderContext {
   viewerSource: CodeViewerSource | null;
   rawFileSummaries: RawToolCallFileSummary[];
   isRunning: boolean;
+  /** 权限预览尚未执行，不展示任何输出或空输出占位。 */
+  isPermissionPreview?: boolean;
   statusLabel: string;
   sourceLabel?: string;
   errorText?: string;

@@ -8,31 +8,34 @@ import type {
   CommandPayloadMap,
   CommandResult,
 } from "@zcode/shared/zcode-protocol-v4";
+import { isHighspeedProviderId } from "@zcode/shared";
+import { createModelExecutionContext } from "../../../session-execution/index.js";
 import { mapAttachmentRefsToTurnAttachments } from "../attachment-refs.js";
 import { inputIntentMetadataFromQueueItem } from "../input-intent.js";
 import { startPromptTurn } from "../prompt-turn.js";
 import { requireRecord } from "../record-access.js";
-import type { V4CommandCoreHost, V4SessionRecordView } from "../types.js";
+import type { V4CommandCoreHost } from "../types.js";
 import {
   applyGoalCommand,
   parseGoalObjectiveFromCommandText,
   startManualCompact,
   V4GoalCompactRejectedError,
 } from "./goal-compact.js";
+import { resolveSessionFallbackModelSelection } from "../input-admission.js";
 import { preemptActiveTurnAndWait } from "./session-flow.js";
 import { V4CommandNoopError } from "../../v4-gateway.js";
 import { commandExecutionContextOf } from "../executor.js";
 export { V4SessionIdleTimeoutError } from "./session-flow.js";
 
 /** sendQueuedNow 在投影里查不到该项原文（已被 drain/删除或 id 无效）→ 拒绝。 */
-class V4QueueItemTextUnavailableError extends Error {
+export class V4QueueItemTextUnavailableError extends Error {
   constructor(queueItemId: string) {
     super(`v4 sendQueuedNow queue item text unavailable: ${queueItemId}`);
     this.name = "V4QueueItemTextUnavailableError";
   }
 }
 
-class V4QueueItemReservedError extends Error {
+export class V4QueueItemReservedError extends Error {
   readonly reasonCode = "guard.queueItemReserved";
   constructor(queueItemId: string) {
     super(`v4 sendQueuedNow queue item already reserved: ${queueItemId}`);
@@ -40,7 +43,7 @@ class V4QueueItemReservedError extends Error {
   }
 }
 
-class V4QueuePromotionCommitError extends Error {
+export class V4QueuePromotionCommitError extends Error {
   readonly reasonCode = "fault.command.queuePromotionCommitFailed";
   constructor(queueItemId: string) {
     super(`v4 sendQueuedNow started but failed to remove queue item: ${queueItemId}`);
@@ -48,7 +51,7 @@ class V4QueuePromotionCommitError extends Error {
   }
 }
 
-class V4QueueItemNotEditableError extends Error {
+export class V4QueueItemNotEditableError extends Error {
   readonly reasonCode = "guard.queueItemNotEditable";
   constructor(queueItemId: string) {
     super(`v4 queue item is not editable: ${queueItemId}`);
@@ -74,6 +77,7 @@ async function deleteQueueItem(
 ): Promise<CommandResult | undefined> {
   const payload = envelope.payload as CommandPayloadMap["deleteQueueItem"];
   const record = requireRecord(host, envelope.sessionId);
+  const queueItem = host.getQueueItem?.(record.app.sessionId, payload.queueItemId) ?? null;
   // 未命中（并发 drain/重复删除的竞态）= noop，不算失败；留 warn 供观测。
   const removed = await record.app.removeQueueItem(payload.queueItemId);
   if (!removed) {
@@ -84,6 +88,9 @@ async function deleteQueueItem(
     // 未命中曾返回 undefined，gateway 会把并发 drain/重复删除误报为 accepted；
     // queue 撤回编辑因此可能把已消费的旧投影再次恢复到 composer。
     throw new V4CommandNoopError("queue.itemMissing");
+  }
+  if (queueItem) {
+    host.deleteQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
   }
   return undefined;
 }
@@ -244,6 +251,67 @@ async function sendQueuedNow(
       leaseReleaseOwnedByBackground = goalContinuationWillStart;
     } else {
       const intent = inputIntentMetadataFromQueueItem(queueItem, queueItem.text);
+      // 手动提升允许 Renderer 为同一张卡补一份新执行材料；卡不同一律忽略，避免跨卡换凭据。
+      const refreshedHighspeedMatchesQueue =
+        payload.highspeedMeta !== undefined &&
+        queueItem.highspeed !== undefined &&
+        payload.highspeedMeta.cardId === queueItem.highspeed.cardId &&
+        payload.highspeedMeta.taskId === queueItem.highspeed.taskId;
+      const ordinarySelection = isHighspeedProviderId(intent.modelSelection?.providerId)
+        ? resolveSessionFallbackModelSelection(record)
+        : intent.modelSelection;
+      // Bug 根因：旧版本已把临时 Highspeed Selection 持久化到 QueueItem。进程升级后
+      // execution bundle 必然丢失；若不在提升边界迁移，会继续用内部 Provider 并直接报错。
+      intent.modelSelection = ordinarySelection;
+      if (refreshedHighspeedMatchesQueue && payload.highspeedMeta) {
+        intent.highspeed = payload.highspeedMeta;
+      }
+      // 凭据不入队列持久化面：先用本次补供的完整 bundle，其次取 CLI 内存暂存。
+      const refreshedExecution =
+        refreshedHighspeedMatchesQueue && payload.modelSelection && payload.modelExecution
+          ? { modelSelection: payload.modelSelection, modelExecution: payload.modelExecution }
+          : undefined;
+      const stagedExecution =
+        refreshedExecution ??
+        host.readQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
+      // Bug 根因：QueueItem.modelSelection 同时承担普通模型和临时加速模型，导致编辑恢复与
+      // 降级目标互相污染。提升边界才临时应用 bundle；失败时保留队列项自己的普通 Selection。
+      const highspeedStillValid =
+        intent.highspeed !== undefined &&
+        intent.highspeed.expiresAt > Date.now() &&
+        stagedExecution !== undefined &&
+        isHighspeedProviderId(stagedExecution.modelSelection.providerId);
+      if (highspeedStillValid && stagedExecution) {
+        intent.modelSelection = stagedExecution.modelSelection;
+      } else if (intent.highspeed) {
+        if (intent.highspeed.expiresAt > Date.now()) {
+          host.logger?.warn?.("v4 queued Highspeed execution unavailable; using queued model", {
+            cardId: intent.highspeed.cardId,
+            queueItemId: queueItem.queueItemId,
+            reason: "execution_missing",
+            sessionId: record.app.sessionId,
+          });
+        }
+        delete intent.highspeed;
+        host.deleteQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
+      }
+      // 退回目标统一为上面的普通 Selection（规则 9）。新队列项的 bundle target 本来就相同；
+      // 旧队列项“立即发送”且服务仍持有同一张卡时，Renderer 以持久化的临时 Provider 重新准备，
+      // target 也是临时 Provider，这里改回，避免降级仍落到内部 Provider。
+      const turnExecution =
+        highspeedStillValid && stagedExecution
+          ? {
+              ...stagedExecution.modelExecution,
+              ...(stagedExecution.modelExecution.selectionFallback
+                ? {
+                    selectionFallback: {
+                      ...stagedExecution.modelExecution.selectionFallback,
+                      target: ordinarySelection,
+                    },
+                  }
+                : {}),
+            }
+          : undefined;
       const started = await startPromptTurn(host, record, {
         content: queueItem.text,
         inputId: queueItem.sourceCommandId,
@@ -252,6 +320,7 @@ async function sendQueuedNow(
         intent,
         requireIdle: true,
         toolDisallowlist: queueItem.toolDisallowlist,
+        ...(turnExecution ? { modelExecution: createModelExecutionContext(turnExecution) } : {}),
         ...(attachments ? { attachments } : {}),
       });
       // 旧 fake app/兼容命令可能不返回 admission receipt；真实 app 已在 Core admission
@@ -259,6 +328,8 @@ async function sendQueuedNow(
       if (started.admission.kind === "queued" || started.admission.kind === "rejected") {
         throw new V4QueuePromotionLeaseUnavailableError();
       }
+      // 凭据已随本轮冻结进 Core；启动成功后立刻销毁暂存副本，失败路径保留以便重试仍能加速。
+      host.deleteQueuedTurnExecution?.(record.app.sessionId, queueItem.sourceCommandId);
     }
     startAdmitted = true;
     const removed = await record.app.removeQueueItem(payload.queueItemId, {

@@ -1,4 +1,7 @@
-import type { RuntimeInputPresentation } from "@zcode/contracts";
+import type { ToolSearchExecutionContext, ToolSearchMode } from "@zcode/contracts";
+import type { RequestVerificationReason } from "@zcode/shared";
+import type { GetAgentDefinitions, LoadAgentDefinitions } from "../subagent/definitions.js";
+import type { RuntimeInputPresentation, TurnExecutionModelFallbackReason } from "@zcode/contracts";
 /* eslint-disable max-lines -- Runtime 类型集中承载 core/runtime 对外结构，拆分需要单独迁移。 */
 import { PermissionService, ToolScheduler } from "./deps.js";
 import type {
@@ -72,6 +75,7 @@ import type {
   ExecutionShellSelection,
   AutomationPort,
   OffPeakPort,
+  TopicResourcePort,
   FileSystemPort,
   HttpClientPort,
   ImageProcessorPort,
@@ -116,12 +120,15 @@ import type { WorkspaceHookRuntimeAdmissionPort } from "../hooks/workspace-hook-
 // -----------------------------------------------
 
 export interface AgentRuntimeConfig {
+  toolSearch?: { mode?: ToolSearchMode };
   /** shared-host CUA request routing metadata; desktop is the safe default. */
   clientMode?: "desktop-continuous" | "web-remote-replayable";
   deliveryKind?: "desktop-continuous" | "web-remote-replayable";
   remoteSessionId?: string;
   bashTimeoutPolicy?: BashTimeoutPolicy;
   presentationSurface?: PresentationSurface;
+  /** Execution Host's output root, independent of the working repository. */
+  genUiOutputRoot?: string;
   mode?: CollaborationMode;
   planEnabled?: boolean;
   modelStreaming?: "off" | "on";
@@ -205,12 +212,20 @@ export interface AgentRuntimeConfig {
   parentSessionId?: SessionId;
   taskType?: SessionTaskType;
   /**
-   * 动态工作流开关：Host 判定后经
-   * ZCode Protocol 下发，runtime 只消费。**缺席即开启**，保留 TUI 默认值；
-   * headless 按 --enable-workflow 显式传 true/false（默认 false），workflow_child 继承父配置。
+   * 动态工作流灰度门（docs/dynamic-workflow/launch.md「Gray release」）：Host 判定后经
+   * ZCode Protocol 下发，runtime 只消费。**缺席即开启**（进程内嵌入方靠这个极性）；
+   * 独立 CLI 的 TUI 与 headless 按 --workflow-mode 显式传 true/false（缺省 disabled，DWG-04），
+   * workflow_child 继承父配置。
    * false 会关闭十个工作流工具，不改变其他工具的注册策略。
    */
   dynamicWorkflowEnabled?: boolean;
+  /**
+   * 灰度 mode `onDemand`（docs/dynamic-workflow/launch.md「On demand: activation」）：十个工作流
+   * 工具推迟到会话首次 `/workflow`（或 GUI 对本会话 run 的 Resume / 配置 / 直接启动、冷恢复时记录里
+   * 已有工作流）才注册。**缺席即立刻注册**，与 dynamicWorkflowEnabled 同极性；只有协议服务端在
+   * Host 下发的 mode 为 onDemand 时写 true。激活状态归 runtime（dynamicWorkflowToolsActivated）。
+   */
+  dynamicWorkflowToolsOnDemand?: boolean;
 
   // Context Builder config
   systemPrompt?: string;
@@ -234,6 +249,8 @@ export interface AgentRuntimeConfig {
   outputStyle?: OutputStylePromptConfig;
   agentName?: string; // Default: "zcode-agent"
   workingDirectory?: string; // Required for context builder
+  /** 本次运行的附加目录，仅用于环境 prompt 展示，不参与配置发现或持久化。 */
+  additionalDirectories?: readonly string[];
   /**
    * 调用方传入的实际工作区路径表示，用于 session 持久化与本地身份恢复。
    * 文件和命令执行仍只使用规范化后的 workingDirectory。
@@ -243,8 +260,8 @@ export interface AgentRuntimeConfig {
   workspaceIdentity?: WorkspaceId;
   envInfo?: EnvInfo; // Optional, will be auto-detected if not provided
   currentDate?: string; // YYYY-MM-DD, resolved by adapter when omitted
-  userInstructions?: UserInstructionsOptions; // AGENTS.md
-  projectContext?: ProjectContext; // auto-detected if not provided
+  userInstructions?: UserInstructionsOptions; // P1: AGENTS.md
+  projectContext?: ProjectContext; // P2: auto-detected if not provided
   skillMetadataBudget?: number;
 }
 
@@ -307,6 +324,10 @@ export interface MemoryRuntimeConfig {
 }
 
 export interface AgentRuntimeDeps {
+  /** 只读目录入口；必须同步读取内存，不在请求收集阶段进行 I/O。 */
+  getAgentDefinitions?: GetAgentDefinitions;
+  /** 新父上下文读取一次；子执行不得继承此加载器。 */
+  loadAgentDefinitions?: LoadAgentDefinitions;
   agentTelemetry?: AgentExecutionTelemetryPort;
   agentTelemetryCausation?: AgentTelemetryCausation;
   agentTelemetryCausationMode?: "child" | "linked_root";
@@ -357,6 +378,9 @@ export interface AgentRuntimeDeps {
    * 包装（受闸门约束），主 runtime 拿治理器的 observer（只喂信号）；缺席即不设闸门。
    */
   modelRequestAdmission?: ModelRequestAdmission;
+  onOffPeakLifecycleEvent?: (
+    event: import("./off-peak/lifecycle.js").OffPeakLifecycleEvent,
+  ) => void;
   workflowPort?: WorkflowPort;
   /** workflow run 的提交/观察/取消端口；存在即 CreateWorkflow 真启动，缺席则回占位诊断。 */
   dynamicWorkflowRunPort?: DynamicWorkflowRunPort;
@@ -367,6 +391,7 @@ export interface AgentRuntimeDeps {
   artifactStore?: ToolArtifactStorePort;
   automationPort?: AutomationPort;
   offPeakPort?: OffPeakPort;
+  topicResourcePort?: TopicResourcePort;
   contextSourcePort?: ContextSourcePort;
   eventSink?: SessionEventSink;
   logger?: Logger;
@@ -396,10 +421,12 @@ export interface ProviderRuntimeHeadersPort {
   shouldRefreshBeforeModelRequest?(input: { providerId: string; modelId: string }): boolean;
   refreshBeforeModelRequest(input: {
     accountAccess?: ZCodeProviderAccountAccess;
+    expectedAccountScope?: string;
+    rejectedProjectTokenFingerprint?: string;
     abortSignal?: AbortSignal;
     modelId: string;
     providerId: string;
-    reason: "model-request";
+    reason: RequestVerificationReason;
     sessionId: SessionId;
     traceContext: TraceContext;
     turnId?: TurnId;
@@ -423,17 +450,39 @@ export interface TurnResult {
  * 也不会成为 Session Selection 的第二份来源。
  */
 export interface ModelExecutionContext {
+  offPeak?: { executionId: string; ticketId: string; providerErrorCode: string };
   /** 仅当前 Turn 跳过自动 Project Memory Extraction；不修改 Session Memory 配置。 */
   memoryExtraction?: "skip";
   selectionScope: "execution";
+  /** 接纳加速输入前固定的 Session 候选；仅在内存中随本条命令传递。 */
+  highspeedFallbackSelection?: ModelSelection;
   requestDependencies?: ModelRequestDependencies;
   subagents?: {
     foregroundModel: "submission";
-    background: "deny";
+    background: "deny" | "allow";
+  };
+  /**
+   * 本次执行的 Selection 失败时，同一 Turn 内退回原模型继续跑完（保留已提交历史，只替换后续请求的
+   * 模型），而不是让整轮直接失败。触发条件必须由发起方声明：`providerId` 限定只匹配本轮 execution
+   * Selection 指向的 provider，`rules` 按声明顺序匹配、首个命中决定退回原因，`providerErrorCode` 缺省
+   * 表示该 provider 的任何失败。core 不按 provider id、模型名或错误文案硬编码。
+   * 退回目标先取 `target`（发起方抽卡时的提交选择，即会话原模型），再取本轮接纳前复制的会话常驻 Session Selection；
+   * 两者都解析不出时无处可退，按真实错误失败。
+   */
+  selectionFallback?: {
+    providerId: string;
+    rules: Array<{
+      reason: TurnExecutionModelFallbackReason;
+      providerErrorCode?: string;
+    }>;
+    target?: ModelSelection;
   };
 }
 
 export interface ExecuteTurnOptionsBase {
+  /** 内存后台命令归属；不进入 canonical intent 或持久化模型默认。 */
+  offPeakExecutionId?: string;
+  executionSelection?: ModelSelection;
   abortSignal?: AbortSignal;
   browserAmbientContext?: {
     tabCount: number;
@@ -484,6 +533,8 @@ export type PromptAdmissionOptions = ExecuteTurnOptions & {
   expectedTurnId?: TurnId;
   /** busy 时的产品队列语义；附件或不可 steer 时由 Core 回退 queue。 */
   queueDelivery?: "guide" | "queue";
+  /** 强制进入 FIFO；用于携带只能在未来独立 turn 安装的临时运行模型。 */
+  requireQueue?: boolean;
   /** queue promotion 等内部调用要求 admission 必须 idle，否则直接拒绝。 */
   requireIdle?: boolean;
 };
@@ -726,6 +777,7 @@ export interface PermissionDecisionResult {
 }
 
 export interface ExecuteToolsOptions {
+  toolSearch?: ToolSearchExecutionContext;
   automationTurn?: boolean;
   offPeakTurn?: boolean;
   signal?: AbortSignal;
@@ -813,6 +865,7 @@ export interface ProviderContextUsageSnapshot {
 }
 
 export interface RunModelTextRequestOptions {
+  toolSearchEnabled?: boolean;
   abortSignal?: AbortSignal;
   assistantMessageId: MessageId;
   events: SessionEvent[];

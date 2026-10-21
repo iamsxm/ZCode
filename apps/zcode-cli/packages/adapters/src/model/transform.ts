@@ -25,6 +25,7 @@ import { dataUrlToDataContent, unsupportedInputMediaText } from "./media-transfo
 import { normalizeOpenAiCompatibleSystemMessages } from "./system-message-compat.js";
 
 export interface AiSdkMessageTransformOptions {
+  toolSearchEnabled?: boolean;
   apiFormat?: string;
   providerOptions?: Record<string, unknown>;
   providerKind?: "openai" | "anthropic" | "openai-compatible" | "gateway" | "custom";
@@ -132,6 +133,9 @@ export function toAiSdkMessages(
               type: "tool-result",
               toolCallId: message.toolCallId,
               toolName,
+              // SDK 合并连续 tool message 时只保留首条的 providerOptions；
+              // 缓存标记必须跟随具体结果块，避免批次末尾标记丢失或被移到其他结果。
+              ...providerOptionsForCacheControl(message.cacheControl),
               output: frameReferenceFailure
                 ? { type: "error-text", value: frameReferenceFailure }
                 : toAiSdkToolResultOutput(
@@ -142,7 +146,6 @@ export function toAiSdkMessages(
                   ),
             },
           ],
-          ...providerOptionsForCacheControl(message.cacheControl),
         });
         pendingToolMediaParts.push(...toolMediaParts);
         break;
@@ -168,15 +171,25 @@ function toAiSdkToolResultOutput(
 
   if (typeof content === "string") return { type: "text", value: content };
 
-  if (textifyStructuredContent) {
+  const hasToolReferences = content.some((block) => block.type === "tool_reference");
+  if (textifyStructuredContent && !hasToolReferences) {
     return { type: "text", value: toStructuredToolResultText(content, options) };
   }
 
-  if (options.stripMedia) {
+  if (options.stripMedia && !hasToolReferences) {
     return { type: "text", value: modelMessageContentToText(content) };
   }
 
-  const value = content.flatMap((block) => contentBlockToAiSdkToolResultParts(block, options));
+  // 工具引用不是媒体：媒体降级不能把引用变成名字文本，否则服务端无法展开定义。
+  const value = content.flatMap((block) => {
+    if (block.type !== "tool_reference" && (textifyStructuredContent || options.stripMedia)) {
+      const text = textifyStructuredContent
+        ? toStructuredToolResultText([block], options)
+        : modelMessageContentToText([block]);
+      return text ? [{ type: "text" as const, text }] : [];
+    }
+    return contentBlockToAiSdkToolResultParts(block, options);
+  });
   return value.length > 0
     ? { type: "content", value }
     : { type: "text", value: modelMessageContentToText(content) };
@@ -189,6 +202,20 @@ function contentBlockToAiSdkToolResultParts(
   switch (block.type) {
     case "text":
       return block.text.length > 0 ? [{ type: "text", text: block.text }] : [];
+
+    case "tool_reference":
+      if (options.providerKind !== "anthropic" || !options.toolSearchEnabled) {
+        throw new AiSdkModelAdapterError(
+          ModelErrorCode.InvalidModelRequest,
+          "Tool references require active Anthropic ToolSearch",
+        );
+      }
+      return [
+        {
+          type: "custom",
+          providerOptions: { anthropic: { type: "tool-reference", toolName: block.toolName } },
+        },
+      ];
 
     case "reasoning":
       return [];
@@ -294,6 +321,11 @@ function contentBlockToAiSdkAssistantParts(
   options: AiSdkAssistantTransformOptions,
 ): AiSdkAssistantContentPart[] {
   switch (block.type) {
+    case "tool_reference":
+      throw new AiSdkModelAdapterError(
+        ModelErrorCode.InvalidModelRequest,
+        "Tool references must appear inside tool results",
+      );
     case "text":
       return block.text.length > 0 ? [{ type: "text", text: block.text }] : [];
 
@@ -403,6 +435,11 @@ function contentBlockToAiSdkUserParts(
   options: AiSdkMessageTransformOptions,
 ): Extract<AiSdkUserContent, unknown[]> {
   switch (block.type) {
+    case "tool_reference":
+      throw new AiSdkModelAdapterError(
+        ModelErrorCode.InvalidModelRequest,
+        "Tool references must appear inside tool results",
+      );
     case "text":
       return block.text.length > 0 ? [{ type: "text", text: block.text }] : [];
 

@@ -1,3 +1,4 @@
+import type { ModelToolReferenceContentBlock } from "../tools/tool-search.js";
 // ============================================================
 // Model Protocol - provider-neutral model contracts
 // ============================================================
@@ -28,6 +29,7 @@ export type ModelId = string & { readonly __brand: "ModelId" };
 export const ModelRequestSessionType = {
   Main: "main",
   Other: "other",
+  SideChat: "side_chat",
   Subagent: "subagent",
 } as const;
 
@@ -37,10 +39,14 @@ export const ModelRequestSessionType = {
  * - `unbounded`：**瞬态**失败无上限重试（退避曲线不变、封顶 60s 后无限探测），永久失败照旧立即抛。
  *   给 workflow actor（taskType workflow_child / nested_workflow_child）使用：模型错误绝不是
  *   workflow 错误，唯一出口是用户 cancel。
+ * - `single-attempt`：本次请求 maxAttempts 收敛为 1，瞬态失败也不重试、首次失败即上抛。
+ *   给带 selectionFallback 声明的执行作用域 Selection（如 Highspeed 加速卡）使用：失败后由 core
+ *   退回会话模型继续本轮，适配层再按默认 10 次退避重试只会把降级拖到数分钟之后。
  */
 export const ModelRetryBudget = {
   Default: "default",
   Unbounded: "unbounded",
+  SingleAttempt: "single-attempt",
 } as const;
 
 export type ModelRetryBudget = (typeof ModelRetryBudget)[keyof typeof ModelRetryBudget];
@@ -222,6 +228,8 @@ export interface ModelRequestCompletedStatusEvent extends ModelNetworkStatusBase
 
 export interface ModelRequestFailedStatusEvent extends ModelNetworkStatusBase {
   type: "model_request_failed";
+  /** Provider 已报告的失败请求用量；不为失败响应伪造成功完成事件。 */
+  usage?: ModelUsage;
   durationMs?: number;
   reason: ModelFailureReason;
   retryable: boolean;
@@ -267,9 +275,21 @@ export interface ModelTelemetryMilestoneStatusEvent extends ModelNetworkStatusBa
   elapsedMs: number;
 }
 
+/** 仅投递进程内 telemetry statusSink，不进入请求 UI 事件；字段不得携带凭据或用户内容。 */
+export type ModelRequestObservation = Readonly<{
+  kind: string;
+  [field: string]: string | number | boolean | undefined;
+}>;
+
+export interface ModelRequestObservationStatusEvent extends ModelNetworkStatusBase {
+  type: "model_request_observation";
+  observation: ModelRequestObservation;
+}
+
 export type ModelNetworkStatusEvent =
   | ModelRequestQueuedStatusEvent
   | ModelRequestAdmittedStatusEvent
+  | ModelRequestObservationStatusEvent
   | ModelRequestStartedStatusEvent
   | ModelRequestCompletedStatusEvent
   | ModelRequestFailedStatusEvent
@@ -384,6 +404,7 @@ export interface ModelResourceLinkContentBlock {
 }
 
 export type ModelMessageContentBlock =
+  | ModelToolReferenceContentBlock
   | ModelTextContentBlock
   | ModelReasoningContentBlock
   | ModelImageContentBlock
@@ -423,6 +444,8 @@ export function modelMessageContentBlockToText(block: ModelMessageContentBlock):
       return block.text;
     case "reasoning":
       return "";
+    case "tool_reference":
+      return block.toolName;
     case "image":
       return attachmentPlaceholder("Attached", block.mediaType, block.source?.placeholder);
     case "video":
@@ -460,6 +483,7 @@ export type ModelToolSideEffectScope =
   | "userInteraction";
 
 export interface ModelToolContract {
+  deferLoading?: boolean;
   name: string;
   description?: string;
   capability?: string;
@@ -634,6 +658,7 @@ export interface ModelRequestSettings {
 }
 
 export interface ModelTextRequest extends ModelRequestSettings {
+  toolSearchEnabled?: boolean;
   messages: ModelInputMessage[];
   tools?: ModelToolContract[];
   toolChoice?: ModelToolChoice;
@@ -844,6 +869,15 @@ const attachmentRefJsonSchema = {
 
 const modelMessageContentBlockJsonSchema = {
   oneOf: [
+    {
+      type: "object",
+      required: ["type", "toolName"],
+      additionalProperties: false,
+      properties: {
+        type: { enum: ["tool_reference"] },
+        toolName: { type: "string", minLength: 1 },
+      },
+    },
     {
       type: "object",
       required: ["type", "text"],

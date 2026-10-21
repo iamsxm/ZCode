@@ -1,9 +1,11 @@
+import type { ToolSearchMode } from "@zcode/contracts";
 import { getDefaultConfigPath, updateUiLocaleInFileConfig } from "@zcode/adapters/config";
 import type { SessionEvent } from "@zcode/contracts";
 import type { ZCodeAppOptions } from "@zcode/bootstrap";
 import { DEFAULT_LOCALE, type SupportedLocale } from "@zcode/i18n";
 import type { TuiRequestPermission } from "@zcode/tui";
 import type { GlobalOptions } from "@zcode/shared-types";
+import type { DynamicWorkflowMode } from "@zcode/shared";
 import { createCommandCenter, parseSlashCommand } from "./command-center.js";
 import type { CommandCenterApp } from "./command-center.js";
 import { resolveDisplayLocale } from "./locale.js";
@@ -38,6 +40,7 @@ import {
 } from "./tui-command-state.js";
 import { createTuiModelAvailabilityChecker } from "./tui-login-state.js";
 import { withTuiMetadata } from "./tui-submit-metadata.js";
+import { DEFAULT_CLI_WORKFLOW_MODE, resolveWorkflowModeRuntimeConfig } from "./workflow-mode.js";
 import type {
   CliModeState,
   CliPermissionMode,
@@ -57,8 +60,10 @@ export function createTuiSubmitPrompt(
   startupLocale: SupportedLocale = DEFAULT_LOCALE,
   toolDisallowlist?: readonly string[],
   forceMcs = false,
+  toolsearchMode: ToolSearchMode = "off",
   browserUse?: GlobalOptions["browserUse"],
   browserExecutable?: GlobalOptions["browserExecutable"],
+  workflowMode: DynamicWorkflowMode = DEFAULT_CLI_WORKFLOW_MODE,
 ): TuiPromptHandler {
   let app: Awaited<ReturnType<NonNullable<RunDependencies["createZCodeApp"]>>> | undefined;
   let activeUiLocale = uiLocale;
@@ -141,13 +146,16 @@ export function createTuiSubmitPrompt(
       sessionId,
       workingDirectory,
     } = await prepareTuiAppRuntime(deps, version, request, processRuntime);
+    const providerEndpointRoutingPort = processRuntime.providerEndpointRoutingPort;
     const browserRuntime = createCliHeadlessBrowserRuntime({ browserExecutable, browserUse }, deps);
     let createdApp: Awaited<ReturnType<NonNullable<RunDependencies["createZCodeApp"]>>>;
     try {
       createdApp = await createAppFactory({
+        modelSelectionMode: "cli-default",
         browserControlPort: browserRuntime?.browserControlPort,
         env: appEnv,
         projectConfigPath: deps.projectConfigPath,
+        ...(providerEndpointRoutingPort ? { providerEndpointRoutingPort } : {}),
         providerRegistry: providerRegistryRuntime.runtime.registryService,
         configuredDefaultModelSelection,
         ...(providerRegistryRuntime.providerRuntimeHeadersPort
@@ -159,7 +167,10 @@ export function createTuiSubmitPrompt(
         runtimeConfig: {
           ...(modeState.override ? { mode: modeState.override } : {}),
           ...(toolDisallowlist ? { toolDisallowlist } : {}),
+          toolSearch: { mode: toolsearchMode },
           ...(forceMcs ? { midConversationSystem: { mode: "force" as const } } : {}),
+          // 首个 app 与 /new、/resume、fork 都经这里创建，mode 因此在进程内一致。
+          ...resolveWorkflowModeRuntimeConfig(workflowMode),
           modelStreaming: "on",
           titleGeneration: TUI_TITLE_GENERATION_CONFIG,
           workingDirectory,
@@ -299,6 +310,7 @@ export function createTuiSubmitPrompt(
       };
     },
     setMode: setCliMode,
+    workflowMode,
   });
 
   const submitPrompt: TuiPromptHandler = async (input, options) => {

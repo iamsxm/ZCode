@@ -22,11 +22,11 @@ import {
 import type { RuntimeModelTextResult } from "../types.js";
 
 type CompactSummaryModelRequest = {
+  toolSearchEnabled?: boolean;
   abortSignal?: AbortSignal;
   maxOutputTokens?: number;
   messages: Parameters<Model["generateText"]>[0]["messages"];
   modelCall?: ModelInvocationContext["modelCall"];
-  modelRequestSessionType?: ModelInvocationContext["modelRequestSessionType"];
   metadata?: ModelInvocationContext["metadata"];
   preserveProviderStreamBoundaries?: boolean;
   statusSink?: ModelInvocationContext["statusSink"];
@@ -312,6 +312,7 @@ function cleanRequest(request: CompactSummaryModelRequest) {
   return {
     messages: request.messages,
     tools: request.tools,
+    toolSearchEnabled: request.toolSearchEnabled,
     abortSignal: request.abortSignal,
     ...(request.maxOutputTokens !== undefined
       ? { options: { maxOutputTokens: request.maxOutputTokens } }
@@ -323,7 +324,6 @@ function invocationContext(request: CompactSummaryModelRequest) {
   return {
     metadata: request.metadata,
     modelCall: request.modelCall,
-    modelRequestSessionType: request.modelRequestSessionType,
     statusSink: request.statusSink,
     traceContext: request.traceContext,
     preserveProviderStreamBoundaries: request.preserveProviderStreamBoundaries,

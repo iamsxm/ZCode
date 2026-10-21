@@ -29,7 +29,7 @@ type CodingPlanProductsSnapshot = Omit<CodingPlanBatchPreviewResponse, "productL
 };
 
 const CODING_PLAN_OAUTH_REQUIRED_ERROR = "coding_plan_oauth_required";
-const ZAI_START_FREE_PRODUCT_ID = "zai-start-free";
+export const ZAI_START_FREE_PRODUCT_ID = "zai-start-free";
 const ZAI_START_FREE_PRODUCT_IDS = {
   month: `${ZAI_START_FREE_PRODUCT_ID}-monthly`,
   quarter: `${ZAI_START_FREE_PRODUCT_ID}-quarterly`,
@@ -37,17 +37,28 @@ const ZAI_START_FREE_PRODUCT_IDS = {
 } as const;
 const CODING_PLAN_PRODUCTS_CACHE_TTL_MS = 30_000;
 const CODING_PLAN_STATIC_PRODUCTS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
-const productRequestCache = new Map<string, Promise<CodingPlanProductsSnapshot>>();
-const productSnapshotCache = new Map<
-  string,
-  { snapshot: CodingPlanProductsSnapshot; expiresAt: number }
+let productRequestCache = new WeakMap<object, Map<string, Promise<CodingPlanProductsSnapshot>>>();
+let productSnapshotCache = new WeakMap<
+  object,
+  Map<string, { snapshot: CodingPlanProductsSnapshot; expiresAt: number }>
 >();
-const productCacheGeneration = new Map<string, number>();
-let staticProductsConfigCache: {
-  config: CodingPlanStaticProductsConfig;
-  expiresAt: number;
-} | null = null;
-let staticProductsConfigRequest: Promise<CodingPlanStaticProductsConfig> | null = null;
+let productCacheGeneration = new WeakMap<object, Map<string, number>>();
+let staticProductsConfigCache = new WeakMap<
+  object,
+  { config: CodingPlanStaticProductsConfig; expiresAt: number }
+>();
+let staticProductsConfigRequest = new WeakMap<object, Promise<CodingPlanStaticProductsConfig>>();
+
+function getServiceCache<T>(
+  cache: WeakMap<object, Map<string, T>>,
+  service: object,
+): Map<string, T> {
+  const existing = cache.get(service);
+  if (existing) return existing;
+  const created = new Map<string, T>();
+  cache.set(service, created);
+  return created;
+}
 
 export function useCodingPlanProducts(
   providerId: CodingPlanProviderId,
@@ -152,22 +163,25 @@ export function useCodingPlanProducts(
   };
 }
 
-async function loadCodingPlanProductsForTest(
+export async function loadCodingPlanProductsForTest(
   providerId: CodingPlanProviderId,
   service: NonNullable<ReturnType<typeof useOptionalServices>>["codingPlanSubscriptionService"],
   force: boolean,
   staticProducts?: CodingPlanStaticProduct[],
 ): Promise<CodingPlanProductsSnapshot> {
   const now = Date.now();
+  const requestCache = getServiceCache(productRequestCache, service);
+  const snapshotCache = getServiceCache(productSnapshotCache, service);
+  const generationCache = getServiceCache(productCacheGeneration, service);
   const generation = force
-    ? invalidateCodingPlanProductsCache(providerId)
-    : (productCacheGeneration.get(providerId) ?? 0);
-  const cachedSnapshot = productSnapshotCache.get(providerId);
+    ? invalidateCodingPlanProductsCache(providerId, service)
+    : (generationCache.get(providerId) ?? 0);
+  const cachedSnapshot = snapshotCache.get(providerId);
   if (!force && cachedSnapshot && cachedSnapshot.expiresAt > now) {
     return cachedSnapshot.snapshot;
   }
 
-  const cachedPromise = productRequestCache.get(providerId);
+  const cachedPromise = requestCache.get(providerId);
   if (!force && cachedPromise) {
     return cachedPromise;
   }
@@ -177,25 +191,25 @@ async function loadCodingPlanProductsForTest(
   // 手动刷新、登录/连接成功和购买完成都用 force 绕过缓存，避免交易状态长期陈旧。
   // 登录/连接成功还必须让旧的未登录试算请求失去写缓存资格，避免它晚返回后覆盖新的登录态试算结果。
   const promise = loadBatchPreviewWithStaticProducts(providerId, service, staticProducts ?? []);
-  productRequestCache.set(providerId, promise);
+  requestCache.set(providerId, promise);
 
   try {
     const snapshot = await promise;
-    if ((productCacheGeneration.get(providerId) ?? 0) === generation) {
-      productSnapshotCache.set(providerId, {
+    if ((generationCache.get(providerId) ?? 0) === generation) {
+      snapshotCache.set(providerId, {
         snapshot,
         expiresAt: now + CODING_PLAN_PRODUCTS_CACHE_TTL_MS,
       });
     }
     return snapshot;
   } finally {
-    if (productRequestCache.get(providerId) === promise) {
-      productRequestCache.delete(providerId);
+    if (requestCache.get(providerId) === promise) {
+      requestCache.delete(providerId);
     }
   }
 }
 
-async function loadCodingPlanStaticProductsSnapshotForTest(
+export async function loadCodingPlanStaticProductsSnapshotForTest(
   providerId: CodingPlanProviderId,
   service: NonNullable<ReturnType<typeof useOptionalServices>>["codingPlanSubscriptionService"],
 ): Promise<CodingPlanProductsSnapshot> {
@@ -205,18 +219,27 @@ async function loadCodingPlanStaticProductsSnapshotForTest(
 
 const loadCodingPlanProducts = loadCodingPlanProductsForTest;
 
-function resolveCodingPlanProductsFailureSnapshot(
+export function resolveCodingPlanProductsFailureSnapshot(
   currentSnapshot: CodingPlanProductsSnapshot | null,
   fallbackSnapshot: CodingPlanProductsSnapshot,
 ): CodingPlanProductsSnapshot {
   return currentSnapshot ?? fallbackSnapshot;
 }
 
-function invalidateCodingPlanProductsCache(providerId: CodingPlanProviderId) {
-  const nextGeneration = (productCacheGeneration.get(providerId) ?? 0) + 1;
-  productCacheGeneration.set(providerId, nextGeneration);
-  productRequestCache.delete(providerId);
-  productSnapshotCache.delete(providerId);
+export function clearCodingPlanProductsCacheForTest() {
+  productRequestCache = new WeakMap();
+  productSnapshotCache = new WeakMap();
+  productCacheGeneration = new WeakMap();
+  staticProductsConfigCache = new WeakMap();
+  staticProductsConfigRequest = new WeakMap();
+}
+
+function invalidateCodingPlanProductsCache(providerId: CodingPlanProviderId, service: object) {
+  const generationCache = getServiceCache(productCacheGeneration, service);
+  const nextGeneration = (generationCache.get(providerId) ?? 0) + 1;
+  generationCache.set(providerId, nextGeneration);
+  getServiceCache(productRequestCache, service).delete(providerId);
+  getServiceCache(productSnapshotCache, service).delete(providerId);
   return nextGeneration;
 }
 
@@ -313,7 +336,7 @@ function formatStartPlanPreviewEntitlement(
   return [amount, unit, period].filter(Boolean).join(" ");
 }
 
-function isZaiStartFreeProductId(productId: string | null | undefined) {
+export function isZaiStartFreeProductId(productId: string | null | undefined) {
   if (!productId) {
     return false;
   }
@@ -362,7 +385,7 @@ function buildStaticProductDisplayList(
   });
 }
 
-async function loadCodingPlanStaticProductListForTest(
+export async function loadCodingPlanStaticProductListForTest(
   providerId: CodingPlanProviderId,
   service: NonNullable<ReturnType<typeof useOptionalServices>>["codingPlanSubscriptionService"],
 ): Promise<CodingPlanStaticProduct[]> {
@@ -422,11 +445,13 @@ async function loadCodingPlanStaticProductsConfig(
   service: NonNullable<ReturnType<typeof useOptionalServices>>["codingPlanSubscriptionService"],
 ): Promise<CodingPlanStaticProductsConfig> {
   const now = Date.now();
-  if (staticProductsConfigCache && staticProductsConfigCache.expiresAt > now) {
-    return staticProductsConfigCache.config;
+  const cached = staticProductsConfigCache.get(service);
+  if (cached && cached.expiresAt > now) {
+    return cached.config;
   }
-  if (staticProductsConfigRequest) {
-    return staticProductsConfigRequest;
+  const cachedRequest = staticProductsConfigRequest.get(service);
+  if (cachedRequest) {
+    return cachedRequest;
   }
 
   if (typeof service.getStaticProducts !== "function") {
@@ -436,17 +461,17 @@ async function loadCodingPlanStaticProductsConfig(
   // 静态套餐来自远端 client/configs，但只有用户真正查看套餐列表时才需要请求；
   // 这里做一天内存缓存和进行中请求合并，避免设置页重渲染或多个 provider 卡片重复拉配置。
   const request = service.getStaticProducts();
-  staticProductsConfigRequest = request;
+  staticProductsConfigRequest.set(service, request);
   try {
     const config = await request;
-    staticProductsConfigCache = {
+    staticProductsConfigCache.set(service, {
       config,
       expiresAt: now + CODING_PLAN_STATIC_PRODUCTS_CACHE_TTL_MS,
-    };
+    });
     return config;
   } finally {
-    if (staticProductsConfigRequest === request) {
-      staticProductsConfigRequest = null;
+    if (staticProductsConfigRequest.get(service) === request) {
+      staticProductsConfigRequest.delete(service);
     }
   }
 }
@@ -498,6 +523,19 @@ export function normalizeErrorMessage(error: unknown): string {
     return CODING_PLAN_OAUTH_REQUIRED_ERROR;
   }
   return message;
+}
+
+export function isCodingPlanOAuthRequiredError(error: string): boolean {
+  return (
+    error === CODING_PLAN_OAUTH_REQUIRED_ERROR ||
+    error === "bigmodel_oauth_required" ||
+    error === "zai_oauth_required" ||
+    isCodingPlanOAuthRequiredMessage(error)
+  );
+}
+
+export function isCodingPlanSystemBusyError(error: string): boolean {
+  return error === CODING_PLAN_SYSTEM_BUSY || isCodingPlanSystemBusyMessage(error);
 }
 
 function readErrorMessage(error: unknown): string {

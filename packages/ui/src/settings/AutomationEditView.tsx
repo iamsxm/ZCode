@@ -16,7 +16,12 @@ import {
   X,
 } from "lucide-react";
 import {
-  resolveWorkspaceKey,
+  ZCODE_AGENT_PROVIDER,
+  type ZCodeAutomation,
+  type ZCodeAutomationRun,
+  type ZCodeAutomationScheduleRule,
+} from "@zcode/shared";
+import {
   testId,
   TID_AUTOMATION_CUSTOM_CONFIRM,
   TID_AUTOMATION_CUSTOM_INTERVAL_DECREMENT,
@@ -37,11 +42,7 @@ import {
   TID_AUTOMATION_YEAR_DAY_OPTION,
   TID_AUTOMATION_YEAR_MONTH_OPTION,
   TID_AUTOMATION_YEAR_MONTHDAY,
-  ZCODE_AGENT_PROVIDER,
-  type ZCodeAutomation,
-  type ZCodeAutomationRun,
-  type ZCodeAutomationScheduleRule,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   AutomationAddScheduleIcon,
   AutomationChevronDownIcon,
@@ -104,7 +105,6 @@ import { resolveLocalizedAutomationCreateTitle } from "@/settings/automationEdit
 import { ModelConfigSelect } from "@/ModelConfigSelect.js";
 import { ThoughtLevelCycleControl } from "@/chat-input-toolbar/ThoughtLevelCycleControl.js";
 import { ConfigSelect } from "@/chat-input-toolbar/display.js";
-import { ChatEmptyWorkspacePreviewMenu, type ChatEmptyWorkspaceMenuTab } from "@/ChatEmptyState.js";
 import {
   AUTOMATION_DEFAULT_MODE,
   buildAutomationModelSelectGroups,
@@ -127,7 +127,8 @@ import {
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { useConfirmDialog } from "@/hooks/useConfirmDialog.js";
 import { useAutomationProjectOptions } from "@/hooks/useAutomationProjectOptions.js";
-import { useModelSelectionView } from "@/hooks/useModelSelectionView.js";
+import { useWorkspaceServicesResolution } from "@/hooks/useWorkspaceServices.js";
+import { useModelSelectionServiceView } from "@/hooks/useModelSelectionView.js";
 import { resolveModelThoughtOption } from "@/lib/modelThoughtOption.js";
 import { decodeCustomModelValue, encodeCustomModelValue } from "@/lib/zcodeCustomModelValue.js";
 import { parseModelPickerValue } from "@/lib/zcodeSessionProjection.js";
@@ -470,7 +471,7 @@ function WeekdayPicker({
               }}
               className="flex h-7 w-full items-center gap-2 rounded-md px-2 text-left text-ui-base text-foreground transition-colors hover:bg-menu-hover"
             >
-              {/* 勾选位放在行首会让星期菜单偏离标准的尾部状态布局。 */}
+              {/* Bug 原因：勾选位放在行首会让星期菜单偏离标准的尾部状态布局。 */}
               <span className="min-w-0 flex-1 truncate">
                 {intl.formatMessage({ id: `automations.weekday.${day}` })}
               </span>
@@ -1011,7 +1012,7 @@ function CustomRepeatDialog({
                 })}
               </button>
             </div>
-            {/* 原生 date input 会在暗色主题中弹出不可控的系统白色月历。*/}
+            {/* 修复原因：原生 date input 会在暗色主题中弹出不可控的系统白色月历。 */}
             <EndDatePicker
               value={endDate}
               min={toDateInputValue(Date.now())}
@@ -1064,7 +1065,7 @@ export interface AutomationEditSubmit {
   workspaceIdentity?: string;
 }
 
-interface AutomationEditViewProps {
+export interface AutomationEditViewProps {
   /** null = 新建；否则编辑。 */
   editing: ZCodeAutomation | null;
   /** 新建预填(来自 More ideas 模板)。 */
@@ -1087,7 +1088,7 @@ interface AutomationEditViewProps {
   onOpenSession?: (sessionId: string) => void;
 }
 
-async function saveAndRunAutomation(
+export async function saveAndRunAutomation(
   save: () => Promise<boolean>,
   run: () => Promise<void> | void,
 ): Promise<boolean> {
@@ -1255,11 +1256,12 @@ export function AutomationEditView({
   // 目标项目 key(仅新建时可改;编辑锁定为 automation 所属项目)。
   const [workspaceKey, setWorkspaceKey] = useState<string | null>(null);
 
-  const localWorkspaceOptions = useAutomationProjectOptions({
-    includeConversationWorkspace: true,
-  });
+  const localWorkspaceOptions = useAutomationProjectOptions();
   const editingWorkspaceOption = editing
-    ? findAutomationWorkspaceOptionByKey(localWorkspaceOptions, editing.workspaceKey)
+    ? findAutomationWorkspaceOptionByKey(
+        localWorkspaceOptions,
+        resolveAutomationWorkspaceSelectionKey(editing),
+      )
     : undefined;
   const workspaceOptions = useMemo<AutomationWorkspaceOption[]>(
     () =>
@@ -1268,16 +1270,9 @@ export function AutomationEditView({
             {
               workspacePath: editing.workspacePath,
               workspaceIdentity: editing.workspaceIdentity,
-              label: workspaceLabelFromPath(editing.workspacePath),
-              ...(editingWorkspaceOption?.remoteSessionId
-                ? { remoteSessionId: editingWorkspaceOption.remoteSessionId }
-                : {}),
-              ...(editingWorkspaceOption?.remoteTarget
-                ? { remoteTarget: editingWorkspaceOption.remoteTarget }
-                : {}),
-              ...(editingWorkspaceOption?.workspacePurpose
-                ? { workspacePurpose: editingWorkspaceOption.workspacePurpose }
-                : {}),
+              projectId: editing.projectId,
+              hostId: editing.hostId,
+              label: editingWorkspaceOption?.label ?? workspaceLabelFromPath(editing.workspacePath),
             },
           ]
         : localWorkspaceOptions,
@@ -1313,12 +1308,7 @@ export function AutomationEditView({
       setThoughtLevel(editingThoughtLevel);
       setBuilder(initialBuilder(editing, initialDraft));
       setEndAt(editing.endAt);
-      setWorkspaceKey(
-        resolveWorkspaceKey({
-          workspacePath: editing.workspacePath,
-          workspaceIdentity: editing.workspaceIdentity,
-        }),
-      );
+      setWorkspaceKey(resolveAutomationWorkspaceSelectionKey(editing));
     } else {
       setScheduleRemoved(!initialDraft);
       // 新建页的默认标题可随 locale 更新；模板标题仍属于用户明确选择的内容。
@@ -1436,26 +1426,17 @@ export function AutomationEditView({
     () => (cronExpr ? describeCronBuilder(builder, intl) : ""),
     [builder, cronExpr, intl],
   );
-  const selectedWorkspace =
+  const selectedWorkspace: AutomationWorkspaceOption | null =
     findAutomationWorkspaceOptionByKey(workspaceOptions, workspaceKey) ??
     (editing
       ? {
           workspacePath: editing.workspacePath,
           workspaceIdentity: editing.workspaceIdentity,
-          label: workspaceLabelFromPath(editing.workspacePath),
+          projectId: editing.projectId,
+          hostId: editing.hostId,
+          label: editingWorkspaceOption?.label ?? workspaceLabelFromPath(editing.workspacePath),
         }
       : null);
-  // 复用输入框空态的项目选择菜单：把表单的项目候选映射成它的 tab 结构。
-  const workspaceMenuTabs = useMemo<ChatEmptyWorkspaceMenuTab[]>(
-    () =>
-      workspaceOptions.map((option) => ({
-        workspacePath: option.workspacePath,
-        label: option.label,
-        ...(option.workspaceIdentity ? { workspaceIdentity: option.workspaceIdentity } : {}),
-        ...(option.workspacePurpose ? { workspacePurpose: option.workspacePurpose } : {}),
-      })),
-    [workspaceOptions],
-  );
   // 新建态无有效项目时保留空目标，避免模型配置读取悄悄回退到 conversation/default workspace。
   const selectedWorkspacePath = selectedWorkspace?.workspacePath ?? "";
   const selectedWorkspaceIdentity = selectedWorkspace?.workspaceIdentity;
@@ -1467,12 +1448,17 @@ export function AutomationEditView({
       : null;
   }, [model, thoughtLevel]);
   // 模型候选属于当前表单目标 Host。项目切换时立即切换订阅；远程目标未连接时
-  // useModelSelectionView 会保持 unavailable，绝不能退回当前设置页的 Local Host。
-  const modelSelectionRead = useModelSelectionView(
+  // 等待远端时保持 unavailable；本地空项目直接读取同 Host 模型目录，不创建假 cwd。
+  const selectionOwner = useWorkspaceServicesResolution(
     selectedWorkspacePath || null,
     selectedWorkspace?.remoteSessionId,
     selectedWorkspaceIdentity,
     selectedWorkspace?.remoteTarget,
+  );
+  const modelSelectionRead = useModelSelectionServiceView(
+    selectionOwner.services.modelSelectionService,
+    Boolean(selectedWorkspace) && selectionOwner.connectionKind !== "remote-waiting",
+    selectedWorkspace ? "remote-waiting" : "missing-target",
     { selection: originalSelection },
   );
   const modelSelectionView =
@@ -1513,35 +1499,21 @@ export function AutomationEditView({
       registrySelectionView: modelSelectionView,
     });
   }, [intl, modelSelectionView]);
-  const isSelectedConversationWorkspace = selectedWorkspace?.workspacePurpose === "conversation";
-  // automation 数据只持久化 workspaceKey/path，编辑态曾直接把 conversation
+  const isSelectedConversationWorkspace =
+    selectedWorkspace?.projectId === null || selectedWorkspace?.workspacePurpose === "conversation";
+  // Bug 原因：automation 数据只持久化 workspaceKey/path，编辑态曾直接把 conversation
   // backing path 当项目展示成 default。匹配当前 canonical 候选恢复 purpose 后，
   // 继续复用会话侧文案；无法匹配的历史目标仍回退到路径名称。
   const selectedWorkspaceDisplayLabel = isSelectedConversationWorkspace
     ? intl.formatMessage({ id: "chat.empty.workOutsideProject" })
     : (selectedWorkspace?.label ?? workspaceLabelFromPath(defaultWorkspacePath));
-  const conversationWorkspace = workspaceOptions.find(
-    (option) => option.workspacePurpose === "conversation",
-  );
-  const handleSelectWorkspace = (workspace: ChatEmptyWorkspaceMenuTab) => {
+  const handleSelectProject = (key: string) => {
+    if (!findAutomationWorkspaceOptionByKey(workspaceOptions, key)) return;
     modelManuallyChangedRef.current = false;
     thoughtManuallyChangedRef.current = false;
     modelSelection.current = "";
     setModel("");
-    // 远程工作区可以共享同一实际路径；旧回调只传 path 再 find，永远命中第一个
-    // 候选。选择事件必须携带 identity，确保模型预览、保存和派发使用用户点击的 workspaceKey。
-    setWorkspaceKey(resolveAutomationWorkspaceSelectionKey(workspace));
-  };
-  const handleSelectConversationWorkspace = () => {
-    if (!conversationWorkspace) return;
-    modelManuallyChangedRef.current = false;
-    thoughtManuallyChangedRef.current = false;
-    modelSelection.current = "";
-    setModel("");
-    // conversation backing workspace 曾被降格成名为 default 的普通项目，
-    // 导致菜单泄露内部目录名和 Folder 图标。这里按 purpose 选择 canonical backing，
-    // 展示则交给会话侧固定的「不在项目中工作」菜单项。
-    setWorkspaceKey(resolveAutomationWorkspaceSelectionKey(conversationWorkspace));
+    setWorkspaceKey(key);
   };
   const modelTriggerLabel = resolveAutomationModelTriggerLabel({
     modelGroups: modelSelectGroups,
@@ -1779,7 +1751,10 @@ export function AutomationEditView({
       if (modelSelection.current !== model || thoughtLevelRef.current !== thoughtLevel)
         return false;
       const input: CreateAutomationInput | UpdateAutomationInput = {
-        // 权限下拉和保存按钮是两个独立控件，快速选择 Plan 后立即保存时，
+        ...(!editing && selectedWorkspace?.projectId
+          ? { projectId: selectedWorkspace.projectId }
+          : {}),
+        // Bugfix: 权限下拉和保存按钮是两个独立控件，快速选择 Plan 后立即保存时，
         // React state 可能还没刷新到 submit 闭包；用 ref 保留最后一次选择，避免落库成默认 build。
         ...buildSubmitInput({
           modeValue: modeRef.current,
@@ -1839,6 +1814,7 @@ export function AutomationEditView({
       thoughtLevel,
       selectedWorkspace?.workspaceIdentity,
       selectedWorkspace?.workspacePath,
+      selectedWorkspace?.projectId,
     ],
   );
 
@@ -2088,7 +2064,7 @@ export function AutomationEditView({
                   {intl.formatMessage({ id: "automations.form.status.label" })}
                 </div>
                 <div className="flex min-h-8 flex-wrap items-center gap-2">
-                  {/* 状态圆点与胶囊沿用了偏大的 8px / 36px 尺寸，未遵循 6px glyph + 20px frame 的规格。 */}
+                  {/* Bug 原因：状态圆点与胶囊沿用了偏大的 8px / 36px 尺寸，未遵循 6px glyph + 20px frame 的规格。 */}
                   <span className="inline-flex h-8 max-w-full items-center gap-1 rounded-lg bg-card pl-2 pr-4 text-ui-base leading-5 text-foreground">
                     <span className="flex size-5 shrink-0 items-center justify-center">
                       <span
@@ -2117,7 +2093,7 @@ export function AutomationEditView({
               >
                 {intl.formatMessage({ id: "automations.form.title.label" })}
               </label>
-              {/* Task title 是标准 Input，不能局部移除全局描边语义。*/}
+              {/* 修复原因：Task title 是标准 Input，不能局部移除全局描边语义。 */}
               <Input
                 id="automation-title"
                 size="lg"
@@ -2227,7 +2203,7 @@ export function AutomationEditView({
                   </DropdownMenu>
                 ) : (
                   <>
-                    {/* 调度栏不用 min-height、换行布局和全行摘要——那些会在新增 tag 后被第二行撑高。
+                    {/* Bugfix：调度栏原先使用 min-height、换行布局和全行摘要，新增 tag 后会被第二行撑高。
                         恢复全局 Input 的 1px 描边后，用 7px 左内边距抵消边框占位，保持首个 tag
                         距外边缘仍为 8px；tag 增加上下各 1px padding 后仍在 36px input 内垂直居中。 */}
                     <div className="relative flex h-9 flex-nowrap items-center gap-1 overflow-hidden rounded-xl border border-input-border bg-input py-1 pl-[7px] pr-9 text-ui-base leading-5 text-foreground transition-colors hover:border-input-border-hover focus-within:border-input-border-focused focus-within:bg-input-focused">
@@ -2255,7 +2231,7 @@ export function AutomationEditView({
                           }));
                         }}
                       >
-                        {/* 频率触发器曾写死深色值，导致浅色主题下对比失真；
+                        {/* 修复原因：频率触发器曾写死深色值，导致浅色主题下对比失真；
                             改用 hover/selected 语义 token，并在 20px 行高外增加上下各 1px padding。 */}
                         <SelectTrigger
                           variant="ghost"
@@ -2326,7 +2302,7 @@ export function AutomationEditView({
                         />
                       ) : null}
 
-                      {/* 重复周期曾写死 #F8F8F8 且三段 tag 圆角不一致；统一语义文字色与 pill 圆角。*/}
+                      {/* Bugfix：重复周期曾写死 #F8F8F8 且三段 tag 圆角不一致；统一语义文字色与 pill 圆角。 */}
                       {builder.frequency === "custom" ? (
                         <button
                           type="button"
@@ -2366,7 +2342,7 @@ export function AutomationEditView({
 
                       {builder.frequency !== "custom" && builder.frequency !== "hourly" ? (
                         <>
-                          {/* 连接词曾单独使用二级色，和相邻 tag 主文字形成错误的高亮断层。*/}
+                          {/* 修复原因：连接词曾单独使用二级色，和相邻 tag 主文字形成错误的高亮断层。 */}
                           <span className="text-foreground">
                             {intl.formatMessage({
                               id: "automations.form.schedule.at",
@@ -2600,29 +2576,29 @@ export function AutomationEditView({
                         )}
                         <span className="max-w-40 truncate">{selectedWorkspaceDisplayLabel}</span>
                       </Button>
-                    ) : workspaceMenuTabs.length > 0 ? (
-                      // Automations 工具条与会话 composer 控件统一使用 rounded-lg，普通会话 chip 不变。
-                      <ChatEmptyWorkspacePreviewMenu
-                        workspacePath={selectedWorkspacePath}
-                        workspaceTabs={workspaceMenuTabs}
-                        // 定时任务允许选择 canonical conversation backing，但不提供 chip 上的快捷 X；
-                        // 菜单展示统一复用会话侧「不在项目中工作」文案和 MessageCircle 图标。
-                        allowConversationWorkspaceSelection={Boolean(conversationWorkspace)}
-                        allowConversationWorkspaceDetach={false}
-                        onSelectWorkspace={handleSelectWorkspace}
-                        onSelectConversationWorkspace={handleSelectConversationWorkspace}
-                        allowOpenWorkspace={false}
-                        allowRemoteWorkspace={false}
-                        onOpenFolder={() => {}}
-                        onConnectRemote={async () => ""}
-                        onSelectRemoteProject={async () => {}}
-                        onCancelRemoteProject={async (_sessionId) => {}}
-                        containerClassName="contents"
-                        triggerClassName={cn(
-                          AUTOMATION_INSTRUCTIONS_TOOLBAR_TRIGGER_CLASSNAME,
-                          "min-w-0 gap-1 px-2",
-                        )}
-                      />
+                    ) : workspaceOptions.length > 0 ? (
+                      <Select value={workspaceKey ?? ""} onValueChange={handleSelectProject}>
+                        <SelectTrigger
+                          data-testid="automation-project-select"
+                          variant="ghost"
+                          className={AUTOMATION_INSTRUCTIONS_TOOLBAR_TRIGGER_CLASSNAME}
+                        >
+                          <FolderOpen className="size-4" aria-hidden="true" />
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {workspaceOptions.map((option) => (
+                            <SelectItem
+                              key={resolveAutomationWorkspaceSelectionKey(option)}
+                              value={resolveAutomationWorkspaceSelectionKey(option)}
+                              data-project-id={option.projectId}
+                              data-project-name={option.label}
+                            >
+                              {option.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
                     ) : (
                       <Button
                         type="button"
@@ -2638,7 +2614,7 @@ export function AutomationEditView({
                       </Button>
                     )}
 
-                    {/* 自动化曾复制首页权限菜单，导致图标、字号和选中态逐渐分叉。
+                    {/* Bugfix：自动化曾复制首页权限菜单，导致图标、字号和选中态逐渐分叉。
                         直接复用首页 ConfigSelect，只覆盖紧凑 trigger 布局。 */}
                     <ConfigSelect
                       option={modeOption}
@@ -2733,7 +2709,7 @@ export function AutomationEditView({
         ) : (
           // History tab：运行历史内联表
           <div>
-            {/* 运行条件已在设置入口说明，历史页重复提示会挤占表格上方空间。*/}
+            {/* 修复原因：运行条件已在设置入口说明，历史页重复提示会挤占表格上方空间。 */}
             {runsLoading && runs.length === 0 ? (
               <div className="flex h-32 items-center justify-center">
                 <Spinner className="size-5" />
@@ -2749,7 +2725,7 @@ export function AutomationEditView({
               </AutomationHistoryEmptyState>
             ) : (
               <div className="overflow-x-auto rounded-[8px]">
-                {/* 运行历史使用可缩放字号，不能继续绑定固定 18px 行高。*/}
+                {/* 修复原因：运行历史使用可缩放字号，不能继续绑定固定 18px 行高。 */}
                 <table className="w-full text-left text-ui-base font-normal leading-normal tracking-[-0.08px]">
                   <thead className="bg-surface text-foreground-subtle">
                     <tr className="h-[30px] border-b border-border">

@@ -1,3 +1,4 @@
+import { SidebarNativeTooltip, ControlHintTooltip } from "@/ControlHintTooltip.js";
 /* eslint-disable max-lines -- WorkspaceFileTree 需要集中编排数据、虚拟列表、吸顶和入口操作状态。 */
 import {
   useCallback,
@@ -29,13 +30,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu.js";
 import { toast } from "@/components/ui/toast.js";
-import { ControlHintTooltip } from "@/ControlHintTooltip.js";
 import { usePlatform } from "@/hooks/usePlatform.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import {
   TID_WORKSPACE_FILE_TREE_PANEL,
   TID_WORKSPACE_FILE_TREE_REFRESH_BUTTON,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import {
   areWorkspaceFilePathsEqual,
   createCodeViewerSourceForWorkspaceFile,
@@ -78,7 +78,7 @@ import type {
   WorkspaceFileTreeStickyFolderItem,
 } from "@/workspace-file-tree/types.js";
 
-function getWorkspaceFileTreeDirectoryLoadDepth(
+export function getWorkspaceFileTreeDirectoryLoadDepth(
   workspacePath: string,
   directoryPath: string,
 ): number {
@@ -226,7 +226,7 @@ export function WorkspaceFileTree({
       return;
     }
     lastNonBlockingRootErrorRef.current = errorMessage;
-    // 根目录已有缓存时，刷新失败只能作为非阻塞提示；阻塞错误页会把保留的旧文件树隐藏掉。
+    // Bugfix: 根目录已有缓存时，刷新失败只能作为非阻塞提示；阻塞错误页会把保留的旧文件树隐藏掉。
     toast(`${intl.formatMessage({ id: "workspaceFileTree.readFailed" })}: ${errorMessage}`);
   }, [intl, rootError, rootLoaded]);
   const gitStatusLabelByStatus = useMemo<Record<WorkspaceFileGitStatus, string>>(
@@ -608,21 +608,25 @@ export function WorkspaceFileTree({
       className="flex h-full min-h-0 flex-col text-foreground"
       data-testid={TID_WORKSPACE_FILE_TREE_PANEL}
     >
-      <div className="px-2 pb-3 pt-3">
-        <Button
-          type="button"
-          variant="ghost"
-          size="lg"
-          className="w-full justify-start gap-2 rounded-xl px-2.5 text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
-          onClick={onClose}
-        >
-          <ArrowLeft className="size-4 shrink-0" />
-          <span className="min-w-0 truncate">
-            {intl.formatMessage({ id: "workspaceFileTree.backToTasks" })}
-          </span>
-        </Button>
-      </div>
-      <div className="flex shrink-0 items-center px-2 pb-2">
+      {onClose ? (
+        <div className="px-2 pb-3 pt-3">
+          <Button
+            type="button"
+            variant="ghost"
+            size="lg"
+            className="w-full justify-start gap-2 rounded-xl px-2.5 text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
+            onClick={onClose}
+          >
+            <ArrowLeft className="size-4 shrink-0" />
+            <span className="min-w-0 truncate">
+              {intl.formatMessage({ id: "workspaceFileTree.backToTasks" })}
+            </span>
+          </Button>
+        </div>
+      ) : (
+        <div className="h-2 shrink-0" />
+      )}
+      <div className="flex shrink-0 items-center gap-1 px-2 pb-2">
         <div className="relative min-w-0 flex-1">
           <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-foreground-subtlest" />
           <Input
@@ -639,21 +643,23 @@ export function WorkspaceFileTree({
             onChange={(event) => setFileSearchQuery(event.currentTarget.value)}
           />
           {fileSearchQuery.length > 0 ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              className="absolute right-1 top-1/2 -translate-y-1/2 text-foreground-subtlest hover:bg-surface-hover hover:text-foreground"
-              aria-label={intl.formatMessage({
-                id: "workspaceFileTree.clearSearch",
-              })}
-              title={intl.formatMessage({
-                id: "workspaceFileTree.clearSearch",
-              })}
-              onClick={() => setFileSearchQuery("")}
-            >
-              <X className="size-3" />
-            </Button>
+            <SidebarNativeTooltip>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                className="absolute right-1 top-1/2 -translate-y-1/2 text-foreground-subtlest hover:bg-surface-hover hover:text-foreground"
+                aria-label={intl.formatMessage({
+                  id: "workspaceFileTree.clearSearch",
+                })}
+                title={intl.formatMessage({
+                  id: "workspaceFileTree.clearSearch",
+                })}
+                onClick={() => setFileSearchQuery("")}
+              >
+                <X className="size-3" />
+              </Button>
+            </SidebarNativeTooltip>
           ) : null}
         </div>
       </div>
@@ -665,16 +671,18 @@ export function WorkspaceFileTree({
         </div>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className="text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
-              aria-label={intl.formatMessage({ id: "common.more" })}
-              title={intl.formatMessage({ id: "common.more" })}
-            >
-              <Ellipsis className="size-3.5" />
-            </Button>
+            <SidebarNativeTooltip>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="text-foreground-subtle hover:bg-surface-hover hover:text-foreground"
+                aria-label={intl.formatMessage({ id: "common.more" })}
+                title={intl.formatMessage({ id: "common.more" })}
+              >
+                <Ellipsis className="size-3.5" />
+              </Button>
+            </SidebarNativeTooltip>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-48">
             <DropdownMenuItem
@@ -792,7 +800,7 @@ export function WorkspaceFileTree({
   );
 }
 
-function getWorkspaceFileTreeBlockingRootError({
+export function getWorkspaceFileTreeBlockingRootError({
   rootLoaded,
   rootError,
 }: {

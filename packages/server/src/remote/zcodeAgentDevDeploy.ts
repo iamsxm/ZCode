@@ -2,7 +2,17 @@
 import { ZCODE_AGENT_PROVIDER, resolveZCodeRuntimeEnv } from "@zcode/shared";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { cp, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm } from "node:fs/promises";
+import {
+  access,
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  readlink,
+  rm,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { IRemoteBackend } from "@zcode/server/remote/backend.js";
@@ -15,6 +25,7 @@ import {
 import {
   buildWriteLiteralFileCommand,
   quotePosixPathArg,
+  quotePosixShellArg,
 } from "@zcode/server/remote/posixShell.js";
 import { createTarGzArchive } from "@zcode/server/remote/localTarGz.js";
 import {
@@ -105,6 +116,9 @@ async function computeDevelopmentAgentAssetsSha256(params: {
     hash.update(`plugin:${packageName}\n`);
     await hashDevelopmentOfficialPluginPackage(hash, packageRoot, packageName);
   }
+  const bundledSkillsRoot = join(params.repoRoot, "apps/zcode-cli/packages/bundled-skills");
+  await assertDevelopmentOfficialPluginRequiredAssets(bundledSkillsRoot, "bundled-skills");
+  await hashLocalPath(hash, bundledSkillsRoot, "bundled-skills");
   return hash.digest("hex");
 }
 
@@ -117,7 +131,7 @@ async function hashDevelopmentOfficialPluginPackage(
   if (!existsSync(manifestPath)) {
     throw new Error(`[zcode-agent-deploy] missing official plugin manifest: ${manifestPath}`);
   }
-  assertDevelopmentOfficialPluginRequiredAssets(packageRoot, packageName);
+  await assertDevelopmentOfficialPluginRequiredAssets(packageRoot, packageName);
 
   for (const topLevelPath of REMOTE_AGENT_OFFICIAL_PLUGIN_INCLUDED_TOP_LEVEL_PATHS) {
     const sourcePath = join(packageRoot, topLevelPath);
@@ -157,16 +171,18 @@ async function hashLocalPath(
   hash.update(await readFile(filePath));
 }
 
-function assertDevelopmentOfficialPluginRequiredAssets(
+async function assertDevelopmentOfficialPluginRequiredAssets(
   packageRoot: string,
   packageName: string,
-): void {
+): Promise<void> {
   const packagePrefix = `${packageName}/`;
   for (const requiredRelativePath of REMOTE_AGENT_OFFICIAL_PLUGIN_REQUIRED_RELATIVE_PATHS) {
     if (!requiredRelativePath.startsWith(packagePrefix)) continue;
     const localRelativePath = requiredRelativePath.slice(packagePrefix.length);
     const requiredPath = join(packageRoot, ...localRelativePath.split("/"));
-    if (!existsSync(requiredPath)) {
+    try {
+      await access(requiredPath);
+    } catch {
       throw new Error(
         `[zcode-agent-deploy] missing official plugin required asset: ${requiredPath}`,
       );
@@ -196,6 +212,7 @@ async function shouldSkipDevelopmentZCodeAgentDeploy(params: {
   runtimeResourceDir: string;
   runtimeVersion: string;
   devVersion: string;
+  localBundleSha256: string;
   force: boolean;
   missingOfficialPluginAssetPaths: string[];
   loggers: DeployLoggers;
@@ -240,6 +257,25 @@ async function shouldSkipDevelopmentZCodeAgentDeploy(params: {
     return false;
   }
 
+  // 旧发布包或另一客户端可能覆盖 bundle，却留下相同的 .dev-version。
+  // 标记只描述上次部署意图；跳过上传前必须在远端校验实际文件，避免 PAT 交给旧版 Agent 的过时鉴权逻辑。
+  const verifyBundleScript =
+    "require('node:fs/promises').readFile(process.argv[1]).then(content => {" +
+    "process.exitCode = require('node:crypto').createHash('sha256').update(content).digest('hex') === process.argv[2] ? 0 : 1;" +
+    "}).catch(() => { process.exitCode = 1; });";
+  try {
+    await waitForClose(
+      await params.backend.exec(
+        `"\${ZCODE_SERVER_RUNTIME_ROOT:-$HOME/.zcode/server}/node" -e ${quotePosixShellArg(verifyBundleScript)} ${quotePosixPathArg(params.remoteBundlePath)} ${quotePosixShellArg(params.localBundleSha256)}`,
+      ),
+    );
+  } catch {
+    params.loggers.logWarn(
+      `[zcode-agent-deploy] ${ZCODE_AGENT_PROVIDER}: 远端 bundle SHA 不匹配或无法校验，重新上传`,
+    );
+    return false;
+  }
+
   params.loggers.log(`[zcode-agent-deploy] ${ZCODE_AGENT_PROVIDER}: 开发态 zcode.cjs 未变化，跳过`);
   return true;
 }
@@ -255,7 +291,7 @@ async function stageDevelopmentOfficialPluginPackages(params: {
     if (!existsSync(manifestPath)) {
       throw new Error(`[zcode-agent-deploy] missing official plugin manifest: ${manifestPath}`);
     }
-    assertDevelopmentOfficialPluginRequiredAssets(sourceRoot, packageName);
+    await assertDevelopmentOfficialPluginRequiredAssets(sourceRoot, packageName);
 
     const targetRoot = join(params.packagesDir, packageName);
     await mkdir(targetRoot, { recursive: true });
@@ -268,6 +304,10 @@ async function stageDevelopmentOfficialPluginPackages(params: {
       }
     }
   }
+  // 修复原因：内置技能不再是插件，单独复制完整包，不能要求 plugin.json 或按插件白名单裁剪。
+  const bundledSkillsRoot = join(params.repoRoot, "apps/zcode-cli/packages/bundled-skills");
+  await assertDevelopmentOfficialPluginRequiredAssets(bundledSkillsRoot, "bundled-skills");
+  await cp(bundledSkillsRoot, join(params.packagesDir, "bundled-skills"), { recursive: true });
 }
 
 async function uploadDevelopmentOfficialPluginPackages(params: {
@@ -376,6 +416,9 @@ export async function deployDevelopmentZCodeAgentRuntime(
       runtimeResourceDir: params.runtimeResourceDir,
       runtimeVersion: params.runtimeVersion,
       devVersion,
+      localBundleSha256: createHash("sha256")
+        .update(await readFile(developmentBundle.localBundlePath))
+        .digest("hex"),
       force: params.force,
       missingOfficialPluginAssetPaths,
       loggers,

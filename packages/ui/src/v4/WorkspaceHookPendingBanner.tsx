@@ -3,7 +3,7 @@ import {
   TID_V4_WORKSPACE_HOOK_PENDING_BANNER,
   TID_V4_WORKSPACE_HOOK_PENDING_DISMISS,
   TID_V4_WORKSPACE_HOOK_PENDING_REVIEW,
-} from "@zcode/shared";
+} from "@zcode/shared/test-ids";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { setPendingSettingsSectionIntent } from "@/lib/settingsNavigation.js";
 import { logger } from "@/logger.js";
@@ -44,15 +44,15 @@ class WorkspaceHookPendingDismissStore {
   }
 }
 
-const workspaceHookPendingDismissStore = new WorkspaceHookPendingDismissStore();
+export const workspaceHookPendingDismissStore = new WorkspaceHookPendingDismissStore();
 
-interface WorkspaceHookAdmissionInfo {
+export interface WorkspaceHookAdmissionInfo {
   pendingCount: number;
   bundleDigest: string;
   workspaceIdentity?: string;
 }
 
-interface WorkspaceHookPendingBannerProps {
+export interface WorkspaceHookPendingBannerProps {
   sessionId: string;
   workspacePath: string;
   workspaceIdentity?: string;
@@ -110,7 +110,14 @@ export const WorkspaceHookPendingBanner = memo(function WorkspaceHookPendingBann
         });
       });
     }
-  }, [admission, commandBindings, openSettingsTab, sessionId, workspaceIdentity, workspacePath]);
+  }, [
+    admission,
+    commandBindings,
+    openSettingsTab,
+    sessionId,
+    workspaceIdentity,
+    workspacePath,
+  ]);
 
   const handleDismiss = useCallback(() => {
     if (admission) {

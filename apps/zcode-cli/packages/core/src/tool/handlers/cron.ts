@@ -96,7 +96,7 @@ function toModelAutomation(automation: CronAutomation): CronAutomation {
   };
 }
 
-const cronCreateHandler: ToolHandler = async (input, context) => {
+export const cronCreateHandler: ToolHandler = async (input, context) => {
   assertNotAutomationTurn(context, "CronCreate");
   const parsed = CronCreateInputSchema.parse(input) as CronCreateInput;
   assertAutomationPort(context, "CronCreate");
@@ -113,7 +113,7 @@ const cronCreateHandler: ToolHandler = async (input, context) => {
   } satisfies CronCreateOutput;
 };
 
-const cronListHandler: ToolHandler = async (input, context) => {
+export const cronListHandler: ToolHandler = async (input, context) => {
   CronListInputSchema.parse(input);
   assertAutomationPort(context, "CronList");
 
@@ -123,7 +123,7 @@ const cronListHandler: ToolHandler = async (input, context) => {
   } satisfies CronListOutput;
 };
 
-const cronUpdateHandler: ToolHandler = async (input, context) => {
+export const cronUpdateHandler: ToolHandler = async (input, context) => {
   assertNotAutomationTurn(context, "CronUpdate");
   const parsed = CronUpdateInputSchema.parse(input) as CronUpdateInput;
   assertAutomationPort(context, "CronUpdate");
@@ -135,7 +135,7 @@ const cronUpdateHandler: ToolHandler = async (input, context) => {
   } satisfies CronUpdateOutput;
 };
 
-const cronDeleteHandler: ToolHandler = async (input, context) => {
+export const cronDeleteHandler: ToolHandler = async (input, context) => {
   assertNotAutomationTurn(context, "CronDelete");
   const parsed = CronDeleteInputSchema.parse(input) as CronDeleteInput;
   assertAutomationPort(context, "CronDelete");
@@ -186,7 +186,9 @@ const cronTimeout = {
 export const cronCreateToolEntry: ToolEntry = {
   capability: "Create a scheduled automation for the current workspace",
   metadata: {
+    shouldDefer: true,
     name: "CronCreate",
+    searchHint: "schedule a recurring or one-shot prompt",
     // 二阶调度要求应在工具 contract 中直接约束模型；自然语言不能靠关键词或正则可靠判定，
     // automation 执行轮的 mutation tool denylist 才是阻止递归修改任务定义的权限边界。
     description:
@@ -250,7 +252,9 @@ export const cronCreateToolEntry: ToolEntry = {
 export const cronListToolEntry: ToolEntry = {
   capability: "List scheduled automations for the current workspace",
   metadata: {
+    shouldDefer: true,
     name: "CronList",
+    searchHint: "list active cron jobs",
     description: "List scheduled automations in the current workspace.",
     readOnly: true,
     destructive: false,
@@ -294,6 +298,7 @@ export const cronListToolEntry: ToolEntry = {
 export const cronUpdateToolEntry: ToolEntry = {
   capability: "Update a scheduled automation in the current workspace",
   metadata: {
+    shouldDefer: true,
     name: "CronUpdate",
     description:
       "Update selected definition fields of an existing scheduled automation in the current workspace while preserving its id and run history.",
@@ -346,7 +351,9 @@ export const cronUpdateToolEntry: ToolEntry = {
 export const cronDeleteToolEntry: ToolEntry = {
   capability: "Delete a scheduled automation from the current workspace",
   metadata: {
+    shouldDefer: true,
     name: "CronDelete",
+    searchHint: "cancel a scheduled cron job",
     description: "Delete a scheduled automation from the current workspace by automation id.",
     readOnly: false,
     destructive: true,

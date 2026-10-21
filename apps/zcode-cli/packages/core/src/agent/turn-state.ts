@@ -10,10 +10,12 @@ import type {
   TraceId,
   TurnId,
 } from "@zcode/contracts";
-import type { ModelToolCall as ToolCall } from "@zcode/contracts";
+import type { ModelToolCall, ModelCallWrapper } from "@zcode/contracts";
 
 // Re-export ToolCall for consumers of this module
-export type { ModelToolCall as ToolCall } from "@zcode/contracts";
+export interface ToolCall extends ModelToolCall {
+  modelCallWrapper?: ModelCallWrapper;
+}
 
 // Note: ModelMessage is defined locally to avoid conflicts with contracts' ModelMessage
 // which uses ToolCallPayload[] instead of ModelToolCall[]
@@ -166,7 +168,8 @@ export interface TurnAttachment {
   path?: string;
   content?: string;
   /** clipboard-text 是 UI 长粘贴落盘生成的临时附件，模型请求中只保留路径引用。 */
-  sourceKind?: "clipboard-text";
+  sourceKind?: "clipboard-text" | "topic-history";
+  messageCount?: number;
   // 展示元信息（协议边界保真透传，TurnStarted 事件/v4 投影展示用；
   // 缺省时由 basename/扩展名推断兜底）。不参与内容解析。
   filename?: string;

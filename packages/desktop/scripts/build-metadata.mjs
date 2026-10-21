@@ -86,6 +86,10 @@ export function collectBuildMetadata() {
 
   return {
     appVersion: normalizeVersion(envVersion || rootPackageJson.version),
+    minCompatibleVersion: normalizeVersion(
+      rootPackageJson.zcodeCompatibility?.minCompatibleVersion ??
+        (envVersion || rootPackageJson.version),
+    ),
     buildCommitId: resolveCommitId(),
     buildTime: new Date().toISOString(),
     electronBuilderVersion: resolveInstalledPackageVersion(
@@ -101,7 +105,15 @@ export function readBuildMetadata() {
   }
 
   try {
-    return readJson(metadataPath);
+    const metadata = readJson(metadataPath);
+    return {
+      ...metadata,
+      minCompatibleVersion:
+        typeof metadata.minCompatibleVersion === "string" &&
+        metadata.minCompatibleVersion.length > 0
+          ? normalizeVersion(metadata.minCompatibleVersion)
+          : normalizeVersion(metadata.appVersion),
+    };
   } catch {
     return null;
   }

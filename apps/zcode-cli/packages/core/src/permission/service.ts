@@ -4,7 +4,9 @@
 
 import {
   AMEND_WORKFLOW_TOOL_NAME,
+  FILL_WORKFLOW_HOLE_TOOL_NAME,
   isAmendWorkflowOwnedPredecessor,
+  isFillWorkflowHoleOwnedRun,
   PermissionCapabilityGroup,
   type PermissionCapabilityGroup as PermissionCapabilityGroupType,
   type PermissionRuleValue,
@@ -45,6 +47,7 @@ export interface PermissionContext {
 }
 
 export interface PermissionToolCapability {
+  userApprovalRule?: string;
   allowedInPlanMode?: boolean;
   alwaysAsk?: boolean;
   readOnly?: boolean;
@@ -60,6 +63,7 @@ export interface PermissionToolCapability {
 export type PermissionBehavior = "allow" | "ask" | "deny";
 
 export interface PermissionDecisionResult {
+  approvalMode?: "user-once";
   decision: PermissionBehavior;
   allowed: boolean;
   reason?: string;
@@ -127,13 +131,26 @@ export class PermissionService {
       );
     }
 
-    // 声明 alwaysAsk 的工具必须经过用户确认，不能被权限模式的放行分支绕过。
+    // 独立 Plan 优先于 Guarded 的 YOLO 基础策略，审批不能解除 Plan 的执行限制。
+    const planEnabled = context.planEnabled ?? context.mode === "plan";
+    if (!planEnabled && context.mode === "guarded" && toolCapability?.userApprovalRule) {
+      return {
+        ...this.ask(
+          context,
+          capability,
+          toolCapability.userApprovalRule,
+          "Dangerous command requires your approval for this execution",
+        ),
+        approvalMode: "user-once",
+      };
+    }
+
+    // 保留 staging 的工具级确认，不被 Guarded 普通调用的 YOLO 基础策略跳过。
     if (capability.alwaysAsk) {
       return this.checkAlwaysAsk(context, capability, projectRules, rulePolicy);
     }
 
-    const planEnabled = context.planEnabled ?? context.mode === "plan";
-    if (context.mode === "yolo" && !planEnabled) {
+    if ((context.mode === "yolo" || context.mode === "guarded") && !planEnabled) {
       return this.allow(context, capability, "mode.yolo", "Yolo mode bypasses permission prompts");
     }
 
@@ -170,6 +187,24 @@ export class PermissionService {
         capability,
         "rule.project.ask",
         `Tool ${context.toolName} requires approval by project permission rules`,
+      );
+    }
+
+    // 原会话回复的接收范围由 Host 再次校验；network 副作用不能让这个免审批契约重新弹窗。
+    // 放在显式 deny/ask 之后，且同时匹配内置工具名和能力，不能扩大其他网络工具的权限。
+    if (
+      context.toolName === "ReplyToChannel" &&
+      capability.permissionName === "channel.reply" &&
+      capability.sideEffectScope === "network" &&
+      capability.riskLevel === "medium" &&
+      !capability.destructive &&
+      !capability.needsApproval
+    ) {
+      return this.allow(
+        context,
+        capability,
+        "tool.channelReply.preapproved",
+        "The originating bot conversation is already authorized",
       );
     }
 
@@ -371,7 +406,7 @@ export class PermissionService {
       );
     }
     // 修订免确认：AmendWorkflow 的前驱是
-    // **本会话发起**的 run、且不是用户亲手停下的，即放行。与会话规则同位——阻断分支之后、ask 之前，
+    // **本会话发起**的 run、不是用户亲手停下的、且这次修订没有引入新 provider，即放行。与会话规则同位——阻断分支之后、ask 之前，
     // 不看模式。事实来自 resolveInput 回填的 `predecessor`（journal 的 parent_session_id / stopReason），
     // 不是内存表：重启、冷恢复后依然成立，也没有可播种、可撤销的东西。别的会话的 run、用户停过的
     // run 照常 ask：钥匙是 run 的归属，不是字段的在场。
@@ -391,12 +426,22 @@ export class PermissionService {
     );
   }
 
-  /** AmendWorkflow 且回填的 `predecessor` 说「本会话的 run、非用户停下」。 */
+  /**
+   * AmendWorkflow 且回填的 `predecessor` 说「本会话的 run、非用户停下」；或 FillWorkflowHole 且回填的
+   * `hole` 说同一件事（docs/dynamic-workflow/launch.md「Approval」：补全是对一个在飞 run 脚本的修订，
+   * 由同一条 amend 规则判定）。
+   */
   private isOwnedWorkflowAmend(context: PermissionContext): boolean {
-    if (context.toolName !== AMEND_WORKFLOW_TOOL_NAME) return false;
     if (!context.input || typeof context.input !== "object") return false;
+    const input = context.input as Record<string, unknown>;
     // 谓词本体住在契约里：就地调并发落回修订时读的必须是同一条规则，不能各写一遍。
-    return isAmendWorkflowOwnedPredecessor((context.input as Record<string, unknown>).predecessor);
+    if (context.toolName === AMEND_WORKFLOW_TOOL_NAME) {
+      return isAmendWorkflowOwnedPredecessor(input.predecessor);
+    }
+    if (context.toolName === FILL_WORKFLOW_HOLE_TOOL_NAME) {
+      return isFillWorkflowHoleOwnedRun(input.hole);
+    }
+    return false;
   }
 
   private checkPlanMode(

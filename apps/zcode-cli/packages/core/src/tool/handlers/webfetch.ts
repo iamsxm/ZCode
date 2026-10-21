@@ -49,7 +49,7 @@ interface FreshWebFetchContent {
   preapprovedUrl: boolean;
 }
 
-const webFetchHandler: ToolHandler = async (input, context) => {
+export const webFetchHandler: ToolHandler = async (input, context) => {
   const parsed = WebFetchInputSchema.parse(input) as WebFetchInput;
   const startedAt = Date.now();
   const normalizedUrl = normalizeWebFetchUrl(parsed.url);
@@ -196,7 +196,9 @@ export const webFetchToolEntry: ToolEntry = {
   capability:
     "Fetch a public URL, convert readable content to markdown, and answer a prompt from it",
   metadata: {
+    shouldDefer: true,
     name: WEBFETCH_TOOL_NAME,
+    searchHint: "fetch and extract content from a URL",
     description: WEBFETCH_DESCRIPTION,
     readOnly: true,
     destructive: false,

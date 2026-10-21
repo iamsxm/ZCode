@@ -35,6 +35,7 @@ import {
   addZCodePluginMarketplace,
   configureZCodePlugin,
   describeZCodePlugin,
+  enrichCachedClaudeMarketplaceIconsForOverview,
   getZCodePluginsOverview,
   installZCodeMarketplacePlugin,
   removeZCodePluginMarketplace,
@@ -91,6 +92,11 @@ function toPluginInfo(plugin: PluginMetadata, configResult?: ConfigResult): ZCod
       })),
     })),
     declaredMcpServerNames: plugin.declaredMcpServerNames,
+    ...(plugin.uiSurfaces?.length ? { uiSurfaces: plugin.uiSurfaces.map((surface) => ({
+      pluginId: plugin.id, pluginName: plugin.name, id: surface.id, title: surface.title,
+      ...(surface.icon ? { icon: surface.icon } : {}), server: surface.server,
+      resourceUri: surface.resourceUri, availability: surface.availability,
+    })) } : {}),
     mcpServerNames: plugin.mcpServerNames,
     ...(hostMcpServerNames.length > 0 ? { hostMcpServerNames } : {}),
     hookDetails: plugin.hookDetails,
@@ -173,20 +179,24 @@ function createMissingConfiguredPluginInfos(
         rootPath: "",
         packageStatus: "missing",
         ...(enabledSource ? { enabledSource } : {}),
-        ...(optionSources && Object.keys(optionSources).length > 0 ? { optionSources } : {}),
+        ...(optionSources && Object.keys(optionSources).length > 0
+          ? { optionSources }
+          : {}),
       },
     ];
   });
 }
 
-function normalizePluginRootForComparison(
+export function normalizePluginRootForComparison(
   rootPath: string,
   platform: NodeJS.Platform = process.platform,
 ): string {
   const resolvedRoot = resolvePath(rootPath);
   // Windows 路径不区分大小写，且配置与 loader 可能分别返回正斜杠和反斜杠。
   // 若直接做字符串比较，会把同一个 Workspace plugins.dirs 根误判为无归属。
-  return platform === "win32" ? resolvedRoot.replaceAll("\\", "/").toLowerCase() : resolvedRoot;
+  return platform === "win32"
+    ? resolvedRoot.replaceAll("\\", "/").toLowerCase()
+    : resolvedRoot;
 }
 
 function toPluginDiagnostic(diagnostic: PluginDiagnostic): ZCodePluginDiagnostic {
@@ -213,7 +223,9 @@ export async function listPlugins(
     logger: context.logger,
     workingDirectory: params.workspace.workspacePath,
   });
-  const plugins = outcome.plugins.map((plugin) => toPluginInfo(plugin, configResult));
+  const plugins = outcome.plugins.map((plugin) =>
+    toPluginInfo(plugin, configResult),
+  );
   return {
     plugins: [
       ...plugins,
@@ -256,6 +268,10 @@ export async function getPluginsOverview(
   rawParams: unknown,
 ): Promise<ZCodePluginsOverviewResult> {
   const params = parseParams(zcodePluginsOverviewParamsSchema, rawParams);
+  enrichCachedClaudeMarketplaceIconsForOverview({
+    logger: context.logger,
+    workingDirectory: params.workspace.workspacePath,
+  });
   const overview = getZCodePluginsOverview({
     configResult: createPluginConfigView(
       context,
@@ -490,14 +506,14 @@ export async function describePlugin(
 ): Promise<ZCodePluginsDescribeResult> {
   const params = parseParams(zcodePluginsDescribeParamsSchema, rawParams);
   const pluginStorageRoot = resolvePluginStorageRoot(params.workspace.workspacePath);
-  const result = await withPluginStorageLock(pluginStorageRoot, async () =>
-    describeZCodePlugin({
-      logger: context.logger,
-      marketplace: params.marketplace,
-      pluginName: params.pluginName,
-      workingDirectory: params.workspace.workspacePath,
-    }),
-  );
+  // 已安装目录、已缓存 manifest 与临时 source 解析都不持锁；只有懒加载 manifest 写入进锁。
+  const result = await describeZCodePlugin({
+    logger: context.logger,
+    marketplace: params.marketplace,
+    pluginName: params.pluginName,
+    withWriteLock: (write) => withPluginStorageLock(pluginStorageRoot, write),
+    workingDirectory: params.workspace.workspacePath,
+  });
   const components: ZCodePluginComponentGroup[] = result.components.map((group) => ({
     kind: group.kind,
     items: group.items.map((item) => ({

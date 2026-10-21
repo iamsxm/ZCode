@@ -1,8 +1,8 @@
 import type { OffPeakTaskRepo } from "@zcode/services/node";
 import type { MainToSchedulerMessage } from "./schedulerProtocol.js";
 
-const OFF_PEAK_DISPATCH_RETRY_BASE_MS = 30_000;
-const OFF_PEAK_DISPATCH_RETRY_CAP_MS = 15 * 60_000;
+export const OFF_PEAK_DISPATCH_RETRY_BASE_MS = 30_000;
+export const OFF_PEAK_DISPATCH_RETRY_CAP_MS = 15 * 60_000;
 
 type OffPeakDispatchResult = Extract<MainToSchedulerMessage, { type: "offpeak-dispatch-result" }>;
 
@@ -11,7 +11,7 @@ type OffPeakDispatchSettlementRepo = Pick<
   "markRunning" | "markTerminal" | "releaseClaim"
 >;
 
-interface OffPeakDispatchSettlementDeps {
+export interface OffPeakDispatchSettlementDeps {
   repo: OffPeakDispatchSettlementRepo;
   retryAt: Map<string, number>;
   retryAttempts: Map<string, number>;
@@ -33,6 +33,8 @@ export async function settleOffPeakDispatchResult(
   if (msg.ok) {
     deps.retryAt.delete(msg.offPeakTaskId);
     deps.retryAttempts.delete(msg.offPeakTaskId);
+    // Host 在放行 CLI 生命周期通知前已落 running；迟到 ACK 不得覆写新票等待或接管状态。
+    if (msg.lifecycleManaged) return;
     const updated = await deps.repo.markRunning(msg.offPeakTaskId, {
       startedAt: now,
       ...(msg.conversationId ? { conversationId: msg.conversationId } : {}),

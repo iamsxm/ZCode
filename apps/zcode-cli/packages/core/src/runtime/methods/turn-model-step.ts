@@ -1,3 +1,7 @@
+import type { ToolSearchExecutionContext } from "@zcode/contracts";
+import { getTurnTools } from "./turn-tool-visibility.js";
+import { isOffPeakUserTakeover, refreshOffPeakTurnAfterTakeover } from "../off-peak/turn.js";
+
 import { beginLocalTurnPreparation } from "@zcode/contracts";
 import {
   CompactTrigger,
@@ -74,6 +78,10 @@ import {
   resolveNormalRequestMaxOutputTokens,
 } from "./model-token-limits.js";
 import {
+  applyExecutionSelectionFallback,
+  matchExecutionSelectionFallback,
+} from "./turn-execution-fallback.js";
+import {
   appendOutputTokenContinuation,
   classifyOutputTokenContinuation,
   commitAssistantToTurnRequest,
@@ -96,6 +104,7 @@ export async function runModelBackedTurnStep(
     recordedMessages: RunModelTextRequestOptions["messages"];
     requestEntries: readonly RuntimeMessageEntry[];
     tools: ModelToolContract[];
+    toolSearch?: ToolSearchExecutionContext;
   },
 ): Promise<ModelStepResult> {
   const assistantMessageId = createMessageId();
@@ -141,6 +150,7 @@ async function runModelBackedTurnStepImpl(
     recordedMessages: RunModelTextRequestOptions["messages"];
     requestEntries: readonly RuntimeMessageEntry[];
     tools: ModelToolContract[];
+    toolSearch?: ToolSearchExecutionContext;
   },
   assistantMessageId: MessageId,
 ): Promise<ModelStepResult> {
@@ -209,6 +219,7 @@ async function runModelBackedTurnStepImpl(
   const streamingToolCoordinator = createStreamingToolCoordinator(this, state, {
     assistantMessageId,
     model,
+    toolSearch: options.toolSearch,
     traceContext: modelTraceContext,
   });
   const networkEventStartIndex = state.events.length;
@@ -258,6 +269,7 @@ async function runModelBackedTurnStepImpl(
       onStreamToolCall: (toolCall) => streamingToolCoordinator.accept(toolCall),
       streamRecovery: streamRecoveryRequest,
       tools: options.tools,
+      toolSearchEnabled: options.toolSearch?.mode === "native",
       traceContext: modelTraceContext,
     });
     throwIfTurnAborted(state.turnAbortSignal);
@@ -273,17 +285,73 @@ async function runModelBackedTurnStepImpl(
       status: state.turnAbortSignal.aborted ? "cancelled" : "error",
     });
     const failedRequestId = latestFailedModelRequestId ?? latestModelRequestId;
+    // 执行 Selection 的声明式退回必须先于同模型 stream recovery：明确归因到加速 provider/network
+    // 边界的请求失败都要退回会话模型（spec §2.2）。若 recovery 在前，流中断后会先在加速模型上
+    // 重试到预算耗尽，降级形同虚设。
+    const selectionFallbackMatch = matchExecutionSelectionFallback({
+      error: finalError,
+      executionProviderId: String(executionModelSelection.providerId),
+      selectionFallback: state.selectionFallback,
+      turnAborted: state.turnAbortSignal.aborted,
+    });
+    const toolCallCountBeforeSelectionFallback = state.toolCallCount;
+    const selectionFallbackResult = selectionFallbackMatch
+      ? await applyExecutionSelectionFallback(this, state, {
+          assistantCreatedAt,
+          assistantMessageId,
+          error: finalError,
+          executionModel: model,
+          match: selectionFallbackMatch,
+          modelTraceContext,
+          streamingToolCoordinator,
+        })
+      : undefined;
+    if (selectionFallbackResult?.applied) {
+      // Bug 根因：fallback settlement 已提交工具结果并建立新 anchor，却继承了此前 length 链的计数，
+      // 使退回模型第一次截断就可能提前耗尽。只按工具计数增量重置，纯文本 tail discard 不绕过上限。
+      if (state.toolCallCount > toolCallCountBeforeSelectionFallback) {
+        completeOutputTokenRecovery(state.turnRequestState);
+      }
+      return "continue";
+    }
     const toolCallCountBeforeStreamRecovery = state.toolCallCount;
+    // Bug 根因：退回目标解析失败后若继续进入通用恢复，会重新请求同一个已失败的 execution provider。
+    // 命中声明就已消费本轮恢复决策；无处可退必须保留原错误并直接失败。
     if (
-      await streamingToolCoordinator.recoverFromModelFailure(
+      !selectionFallbackMatch &&
+      (await streamingToolCoordinator.recoverFromModelFailure(
         error,
         assistantCreatedAt,
         failedRequestId ? { failedRequestId } : undefined,
-      )
+      ))
     ) {
       if (state.toolCallCount > toolCallCountBeforeStreamRecovery) {
         completeOutputTokenRecovery(state.turnRequestState);
       }
+      return "continue";
+    }
+    if (
+      !state.turnAbortSignal.aborted &&
+      isOffPeakUserTakeover(error) &&
+      refreshOffPeakTurnAfterTakeover(this, state)
+    ) {
+      await streamingToolCoordinator.abandon("model_failed");
+      await this.persistAssistantMessage(
+        assistantMessageId,
+        state.userMessageId,
+        assistantCreatedAt,
+        {
+          completed: Date.now(),
+          finish: "off_peak_request_replaced",
+        },
+        modelTraceContext,
+        model,
+      );
+      state.modelResponse = "";
+      state.modelStepCount += 1;
+      recordModelHistoryRound(state);
+      state.turnMachine = new TurnMachineImpl(state.turnMachine.receiveModelResponse(""));
+      state.turnMachine = new TurnMachineImpl(state.turnMachine.aggregateResults());
       return "continue";
     }
     const admissionRetryDelayMs = getStartPlanBusyAdmissionRetryDelayMs({
@@ -292,7 +360,11 @@ async function runModelBackedTurnStepImpl(
       state,
       turnNumber: this.turnNumber,
     });
-    if (!state.turnAbortSignal.aborted && admissionRetryDelayMs !== undefined) {
+    if (
+      !selectionFallbackMatch &&
+      !state.turnAbortSignal.aborted &&
+      admissionRetryDelayMs !== undefined
+    ) {
       // 第二轮及以后 Start Plan 可能在首 token 前被 admission 并发限制拒绝；
       // 这时没有文本或 tool anchor，旧 stream recovery 不会启动，必须关闭空 assistant 后短重试。
       const recoveryAttempt = beginStartPlanBusyAdmissionRetryAttempt(state);
@@ -354,6 +426,7 @@ async function runModelBackedTurnStepImpl(
       return "continue";
     }
     if (
+      !selectionFallbackMatch &&
       state.streamRecoveryRetryCount > 0 &&
       !state.turnAbortSignal.aborted &&
       isStartPlanBusyStreamRecoveryFailure(finalError)
@@ -362,9 +435,12 @@ async function runModelBackedTurnStepImpl(
       // 继续抛原 provider 文案会和首轮繁忙失败无法区分，UI 也就不能展示“自动重试达到最大次数”。
       finalError = createStartPlanBusyAutoRetryExhaustedError(finalError);
     }
-    await streamingToolCoordinator.abandon(
-      state.turnAbortSignal.aborted ? "cancelled" : "model_failed",
-    );
+    // 无 fallback target 时工具已在上方 settlement；再次 abandon 会发布与终态矛盾的 ledger 事件。
+    if (!selectionFallbackResult?.settledAcceptedTools) {
+      await streamingToolCoordinator.abandon(
+        state.turnAbortSignal.aborted ? "cancelled" : "model_failed",
+      );
+    }
     if (
       state.turnAbortSignal.aborted &&
       isTurnCancellationError(finalError, state.turnAbortSignal)
@@ -642,7 +718,9 @@ async function runModelBackedTurnStepImpl(
     toolCallCount: toolCalls.length,
   });
 
-  const executableToolCalls = toolCalls.filter((toolCall) => !toolCall.providerExecuted);
+  const executableToolCalls = toolCalls
+    .filter((toolCall) => !toolCall.providerExecuted)
+    .map((toolCall) => streamingToolCoordinator.admit(toolCall));
   const streamedToolResults = await streamingToolCoordinator.drain(executableToolCalls);
   if (outputTokenContinuation !== "none") {
     // 首次命中 output-limit 时，当前 request 可能带有一次性的 project-memory attachment；
@@ -722,6 +800,7 @@ async function runModelBackedTurnStepImpl(
     recordModelHistoryRound(state);
   }
   const toolStepResult = await executeToolCallsForModelStep.call(this, state, {
+    toolSearch: options.toolSearch,
     assistantCreatedAt,
     assistantMessageId,
     modelTraceContext,
@@ -779,9 +858,11 @@ async function recoverModelStepAfterContextExceeded(
     {
       activeEntries,
       modelStepIndex,
+      agentListingTools: getTurnTools(this, state),
       rapidRefillCount: rapidRefill.consecutiveRapidRefills,
       model: state.model,
       turnRequestState: state.turnRequestState,
+      getContinuationTools: () => getTurnTools(this, state),
     },
   );
   if (compactOutcome !== "compacted") {

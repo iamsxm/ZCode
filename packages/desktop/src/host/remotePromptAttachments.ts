@@ -3,17 +3,17 @@ import { quotePosixPathArg } from "@zcode/server/remote/posixShell.js";
 import type { TraceId, ZCodePromptAttachment } from "@zcode/shared";
 import { randomUUID } from "node:crypto";
 
-const REMOTE_PROMPT_ATTACHMENT_ROOT = "~/.zcode/tmp/prompt-attachments";
+export const REMOTE_PROMPT_ATTACHMENT_ROOT = "~/.zcode/tmp/prompt-attachments";
 const REMOTE_PROMPT_ATTACHMENT_RELATIVE_ROOT = ".zcode/tmp/prompt-attachments";
 
-interface RemotePromptAttachmentMaterializeInput {
+export interface RemotePromptAttachmentMaterializeInput {
   taskId?: string;
   content: string;
   traceId: TraceId | string;
   attachments?: ZCodePromptAttachment[];
 }
 
-interface RemotePromptAttachmentMaterializeResult {
+export interface RemotePromptAttachmentMaterializeResult {
   content: string;
   attachments?: ZCodePromptAttachment[];
   uploadedCount: number;
@@ -127,7 +127,7 @@ export async function cleanupStaleRemotePromptAttachments(
   );
 }
 
-function buildRemotePromptAttachmentPath(params: {
+export function buildRemotePromptAttachmentPath(params: {
   filename: string;
   index: number;
   nonce?: string;
@@ -279,96 +279,4 @@ function sanitizePathSegment(value: string): string {
     .replace(/^-+/u, "")
     .replace(/-+$/u, "");
   return sanitized || "attachment";
-}
-
-export function createRemotePromptAttachmentTaskService<T extends object>(
-  service: T,
-  options: {
-    materializePromptAttachments: (
-      params: RemotePromptAttachmentMaterializeInput & { taskId: string },
-    ) => Promise<Pick<RemotePromptAttachmentMaterializeResult, "content" | "attachments">>;
-  },
-): T {
-  return createRemotePromptAttachmentServiceProxy(service, {
-    methods: new Set(["sendPrompt", "enqueueTaskCommand"]),
-    materializePromptAttachments: options.materializePromptAttachments,
-    readTaskId: (params) => stringValue((params as { taskId?: unknown }).taskId),
-    readTraceId: (params) => stringValue((params as { traceId?: unknown }).traceId),
-  });
-}
-
-export function createRemotePromptAttachmentSessionService<T extends object>(
-  service: T,
-  options: {
-    materializePromptAttachments: (
-      params: RemotePromptAttachmentMaterializeInput & { taskId: string },
-    ) => Promise<Pick<RemotePromptAttachmentMaterializeResult, "content" | "attachments">>;
-  },
-): T {
-  return createRemotePromptAttachmentServiceProxy(service, {
-    methods: new Set(["sendPrompt"]),
-    materializePromptAttachments: options.materializePromptAttachments,
-    readTaskId: (params) => stringValue((params as { sessionId?: unknown }).sessionId),
-    readTraceId: (params) =>
-      stringValue((params as { inputId?: unknown }).inputId) ??
-      stringValue((params as { sessionId?: unknown }).sessionId),
-  });
-}
-
-function createRemotePromptAttachmentServiceProxy<T extends object>(
-  service: T,
-  options: {
-    methods: Set<string>;
-    materializePromptAttachments: (
-      params: RemotePromptAttachmentMaterializeInput & { taskId: string },
-    ) => Promise<Pick<RemotePromptAttachmentMaterializeResult, "content" | "attachments">>;
-    readTaskId: (params: object) => string | undefined;
-    readTraceId: (params: object) => string | undefined;
-  },
-): T {
-  return new Proxy(service, {
-    get(target, property, receiver) {
-      const value = Reflect.get(target, property, receiver);
-      if (
-        typeof property !== "string" ||
-        !options.methods.has(property) ||
-        typeof value !== "function"
-      ) {
-        return value;
-      }
-
-      return async (...args: unknown[]) => {
-        const params = args[0];
-        if (typeof params !== "object" || params === null) {
-          return value.apply(target, args);
-        }
-        const content = stringValue((params as { content?: unknown }).content);
-        const taskId = options.readTaskId(params);
-        const traceId = options.readTraceId(params);
-        if (content === undefined || !taskId || !traceId) {
-          return value.apply(target, args);
-        }
-        const prepared = await options.materializePromptAttachments({
-          taskId,
-          traceId,
-          content,
-          attachments: Array.isArray((params as { attachments?: unknown }).attachments)
-            ? (params as { attachments?: ZCodePromptAttachment[] }).attachments
-            : undefined,
-        });
-        const nextParams: Record<string, unknown> = {
-          ...params,
-          content: prepared.content,
-        };
-        if ("attachments" in params || prepared.attachments !== undefined) {
-          nextParams.attachments = prepared.attachments;
-        }
-        return value.call(target, nextParams);
-      };
-    },
-  });
-}
-
-function stringValue(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
 }

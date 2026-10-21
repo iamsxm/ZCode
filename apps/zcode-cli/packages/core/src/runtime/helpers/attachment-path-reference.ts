@@ -7,6 +7,7 @@ import { inferVideoMimeFromPath } from "./attachment-video.js";
 type PathReferenceReason =
   | "binary_file"
   | "deferred_clipboard_text"
+  | "deferred_topic_history"
   | "image_too_large"
   | "pdf_too_large"
   | "text_too_large"
@@ -63,6 +64,8 @@ export function resolvedPathReferenceAttachment(
       recoverability: "metadata_only",
       sizeBytes: options.sizeBytes,
       storageKind: "local_ref",
+      // 原说明只存在于 contentBlock 时，冷恢复会丢失降级原因和读取提示，改变模型历史前缀。
+      pathReferenceText: content,
     },
     mime,
     source: options.source,
@@ -93,6 +96,7 @@ export function inferAttachmentMimeFromPath(path: string): string {
 }
 
 function formatPathReferenceReason(reason: PathReferenceReason): string {
+  if (reason === "deferred_topic_history") return "topic history is provided for on-demand reading";
   if (reason === "deferred_clipboard_text") {
     return "it is a pasted-text temporary attachment that is deferred to keep the model context small";
   }

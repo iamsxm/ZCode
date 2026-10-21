@@ -45,14 +45,14 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function parseWindowsBuildNumber(releaseText: string): number | undefined {
+export function parseWindowsBuildNumber(releaseText: string): number | undefined {
   const buildText = releaseText.split(".")[2];
   if (!buildText) return undefined;
   const buildNumber = Number.parseInt(buildText, 10);
   return Number.isFinite(buildNumber) ? buildNumber : undefined;
 }
 
-function resolveTerminalWindowsPtyInfo(
+export function resolveTerminalWindowsPtyInfo(
   platform: NodeJS.Platform = process.platform,
   releaseText: string = release(),
 ): TerminalWindowsPtyInfo | undefined {
@@ -195,7 +195,7 @@ function resolveFallbackUtf8Locale(env: NodeJS.ProcessEnv): string {
   return process.platform === "darwin" ? "en_US.UTF-8" : "C.UTF-8";
 }
 
-function resolveTerminalEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function resolveTerminalEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const nextEnv = { ...env };
   const fallbackLocale = resolveFallbackUtf8Locale(env);
 
@@ -282,7 +282,7 @@ function spawnTerminalProcess(params: {
   }
 }
 
-function resolveTerminalShell(): string {
+export function resolveTerminalShell(): string {
   if (process.platform === "win32") {
     // Windows PowerShell 5.1 的 PSReadLine 在 ConPTY 下更容易把输入行空白重绘成 ANSI black 背景。
     // PowerShell 7+ 的终端兼容性更接近桌面端，优先使用已安装的 pwsh，找不到再回退到系统自带 shell。
@@ -307,8 +307,8 @@ function resolveTerminalShell(): string {
   throw new Error("No usable shell found for terminal startup");
 }
 
-function resolveTerminalCwd(cwd?: string): string {
-  // 工作区目录可能已经被删除、移动，或者启动时传进来的是一个失效路径。
+export function resolveTerminalCwd(cwd?: string): string {
+  // 修复原因：工作区目录可能已经被删除、移动，或者启动时传进来的是一个失效路径。
   // 之前把这个 cwd 原样传给 node-pty，同样会在 spawn 阶段失败。
   // 这里优先使用传入目录，不可用时回退到 HOME / 系统 home / 根目录，保证终端还能拉起。
   const candidates = [cwd, process.env.HOME, homedir(), "/"];
@@ -318,6 +318,56 @@ function resolveTerminalCwd(cwd?: string): string {
   }
 
   throw new Error("No usable working directory found for terminal startup");
+}
+
+/** 无监听者期间最多保留的 PTY 输出字符数；超出后丢弃最旧的块，保留屏幕上最可能仍可见的尾部。 */
+const TERMINAL_UNSUBSCRIBED_OUTPUT_MAX_CHARS = 1_048_576;
+
+/**
+ * Bug 原因（R3 远端终端 xterm 恒空，2026-09-14）：PTY 的首批输出（bash 提示符在 spawn 后约 10ms 就到达）
+ * 在 renderer 通过 create() 拿到 id 并订阅 onDynamicData 之前就已 fire，而普通 Emitter 在没有监听者时
+ * 直接丢弃事件，ProxyChannel 对 onDynamicXxx 也不做缓冲。本地链路往返只有毫秒级，多数时候能抢在提示符
+ * 之前订阅；远端目标经 SSH 往返 40~200ms，首个提示符必丢，之后 shell 空闲再无输出，用户看到空白终端。
+ * 修法：输出的唯一来源在这里，于是在没有监听者时把输出有界缓存，监听者到来后按序回放再转直通。
+ * 订阅断开（例如远端连接换代）期间同样缓存，避免重连后丢失中间输出；不依赖任何超时。
+ */
+function createBufferedTerminalOutputEmitter(): {
+  emitter: Emitter<string>;
+  push: (data: string) => void;
+} {
+  const pending: string[] = [];
+  let pendingChars = 0;
+  let hasListener = false;
+
+  const emitter: Emitter<string> = new Emitter<string>({
+    // Emitter 会先登记监听者再触发该钩子，因此这里 fire 能直接送达刚订阅的监听者。
+    onWillAddFirstListener: () => {
+      hasListener = true;
+      const buffered = pending.splice(0);
+      pendingChars = 0;
+      for (const chunk of buffered) {
+        emitter.fire(chunk);
+      }
+    },
+    onDidRemoveLastListener: () => {
+      hasListener = false;
+    },
+  });
+
+  return {
+    emitter,
+    push: (data) => {
+      if (hasListener) {
+        emitter.fire(data);
+        return;
+      }
+      pending.push(data);
+      pendingChars += data.length;
+      while (pendingChars > TERMINAL_UNSUBSCRIBED_OUTPUT_MAX_CHARS && pending.length > 1) {
+        pendingChars -= pending.shift()?.length ?? 0;
+      }
+    },
+  };
 }
 
 export function createTerminalService(dependencies: {
@@ -350,7 +400,11 @@ export function createTerminalService(dependencies: {
   }
 
   const service: ITerminalService & { disposeAll(): void } = {
-    async create(params: { cols: number; rows: number; cwd?: string }): Promise<{
+    async create(params: {
+      cols: number;
+      rows: number;
+      cwd?: string;
+    }): Promise<{
       id: string;
       shell: string;
       fontFamily: string;
@@ -363,17 +417,20 @@ export function createTerminalService(dependencies: {
       const shell = resolveTerminalShell();
       const cwd = resolveTerminalCwd(params.cwd);
       const env = resolveTerminalEnv();
-      const terminalProfileSettings = await dependencies.settingService.get().catch(() => ({
-        terminalFontFamily: undefined,
-        terminalInheritSystemProfile: true,
-      }));
+      const terminalProfileSettings = await dependencies.settingService
+        .get()
+        .catch(() => ({
+          terminalFontFamily: undefined,
+          terminalInheritSystemProfile: true,
+        }));
       const fontProfile = resolveTerminalFontProfile({
         settings: terminalProfileSettings,
         env: process.env,
       });
       const nodePty = await loadNodePtyModule();
       ensureNodePtySpawnHelperExecutable();
-      const dataEmitter = new Emitter<string>();
+      const terminalOutput = createBufferedTerminalOutputEmitter();
+      const dataEmitter = terminalOutput.emitter;
       const exitEmitter = new Emitter<number>();
 
       let p: IPty;
@@ -387,12 +444,10 @@ export function createTerminalService(dependencies: {
           env,
         });
       } catch (error) {
-        throw new Error(
-          `Failed to start terminal with shell '${shell}' in '${cwd}': ${getErrorMessage(error)}`,
-        );
+        throw new Error(`Failed to start terminal with shell '${shell}' in '${cwd}': ${getErrorMessage(error)}`);
       }
 
-      p.onData((data) => dataEmitter.fire(data));
+      p.onData((data) => terminalOutput.push(data));
       p.onExit(({ exitCode }) => {
         exitEmitter.fire(exitCode);
         dataEmitter.dispose();

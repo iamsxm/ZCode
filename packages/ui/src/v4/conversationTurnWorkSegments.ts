@@ -8,6 +8,13 @@ import {
   ENABLE_CUA_TOOL_CALL_GROUPING,
   prepareCuaGroupFlowItems,
 } from "@/v4/conversationCuaGroups.js";
+// Bugfix：必须直接引用纯函数模块，不能走 `@/plugin-ui/index.js` 桶文件。本文件在分享只读
+// 时间线闭包里，桶文件会把 plugin-ui 全量组件 → V4ConversationContext → @zcode/services →
+// @zcode/provider 拖进 web-share 构建，导致 `@zcode/shared/mcp-apps` 等子路径无法解析、构建失败。
+import {
+  isPluginUiPinnedToolRow,
+  type PluginUiRowPinResolver,
+} from "@/plugin-ui/domain/pluginUiRowPolicy.js";
 import { buildConversationFlowItems } from "@/v4/conversationTurnFlowItems.js";
 import type { AssistantWorkRow, ConversationTurnFlowItem } from "@/v4/conversationTurnFlowItems.js";
 
@@ -143,6 +150,8 @@ export function buildConversationTurnWorkSegments(options: {
   forceOpenHistory: boolean;
   timelineOnly: boolean;
   nowMs?: number;
+  /** 插件卡片进不进折叠区的裁决；缺省沿用"全部常驻"。 */
+  pluginUiPinResolver?: PluginUiRowPinResolver;
 }): ConversationTurnWorkSegment[] {
   const visualDrafts = splitVisualWorkSegments(options.orderedRows);
   const tailRowIds = new Set(options.assistantTailRows.map((row) => row.rowId));
@@ -164,11 +173,14 @@ export function buildConversationTurnWorkSegments(options: {
     const visibleAssistantIndex = visibleAssistantTextRow
       ? segmentFlowRows.findIndex((row) => row.rowId === visibleAssistantTextRow.rowId)
       : -1;
-    const segmentHistoryRows = options.timelineOnly
-      ? []
-      : visibleAssistantIndex < 0
-        ? segmentFlowRows
-        : segmentFlowRows.slice(0, visibleAssistantIndex);
+    // 插件 UI 工具行留在折叠区外（与 assistantText 同级），过程行照常折叠；见 isPluginUiPinnedToolRow。
+    const segmentHistoryRows = (
+      options.timelineOnly
+        ? []
+        : visibleAssistantIndex < 0
+          ? segmentFlowRows
+          : segmentFlowRows.slice(0, visibleAssistantIndex)
+    ).filter((row) => !isPluginUiPinnedToolRow(row, options.pluginUiPinResolver));
     const segmentFollowingRows =
       visibleAssistantIndex < 0 ? [] : segmentFlowRows.slice(visibleAssistantIndex + 1);
     const segmentRunning = segmentIndex === visualDrafts.length - 1 && options.isRunning;

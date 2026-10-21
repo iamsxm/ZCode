@@ -44,7 +44,7 @@ import {
   type AttachmentUploadOptions,
 } from "@/v4/attachmentUploadTransaction.js";
 
-interface AgentConversationTransportTarget {
+export interface AgentConversationTransportTarget {
   workspacePath: string;
   workspaceIdentity?: string;
   /** Desktop 本地媒体协议 URL；Web/remote 不注入，因此保持分片读取。 */
@@ -209,6 +209,9 @@ export function createAgentConversationTransport(
           sessionId,
           ...(params.base ? { base: params.base } : {}),
           ...(params.visibility ? { visibility: params.visibility } : {}),
+          ...(params.retryInitialization
+            ? { retryInitialization: params.retryInitialization }
+            : {}),
         });
         if (subscribeRuntimeGeneration !== runtimeGeneration) {
           // 旧 runtime 的迟到 ACK 可能复用新 runtime 的 subId；此处只能
@@ -347,7 +350,10 @@ export function createAgentConversationTransport(
         throw error;
       }
     },
-    async sendCommand(envelope: CommandEnvelope): Promise<CommandAck> {
+    async sendCommand(
+      envelope: CommandEnvelope,
+      context?: { projectId?: string | null },
+    ): Promise<CommandAck> {
       const hello = await ensureHandshake();
       const payload = envelope.payload as {
         planEnabled?: boolean;
@@ -361,8 +367,8 @@ export function createAgentConversationTransport(
       ) {
         throw new Error("proto.independentPlanUnsupported");
       }
-      return sendWithConversationDelayE2E(() =>
-        agentService.sendConversationCommandV4({ ...workspace, envelope }),
+      return sendWithConversationDelayE2E(envelope, () =>
+        agentService.sendConversationCommandV4({ ...workspace, ...context, envelope }),
       );
     },
     async queryCommands(params: CommandsQueryParams): Promise<CommandsQueryResult> {

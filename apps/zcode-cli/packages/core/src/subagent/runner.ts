@@ -3,6 +3,7 @@
 // Subagent Runner
 // ============================================================
 
+import type { GetAgentDefinitions } from "./definitions.js";
 import {
   AgentErrorCode,
   CoreErrorType,
@@ -117,6 +118,7 @@ export interface ExploreSubagentPortOptions {
   enqueueParentTaskNotification?: EnqueueParentTaskNotification;
   outputRootDir?: string;
   profiles?: readonly AgentProfile[];
+  getAgentDefinitions?: GetAgentDefinitions;
   builtInModelSelectionOverrides?: Partial<
     Record<"general-purpose" | "Explore", import("@zcode/shared").ModelSelection>
   >;
@@ -132,9 +134,10 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
   const registry = options.runtimeTaskRegistry ?? new InMemoryRuntimeTaskRegistry();
   const abortControllers = new Map<string, AbortController>();
   const borrowedForegroundAgentIds = new Set<string>();
-  const profiles = normalizeAgentProfiles(options.profiles ?? [], {
+  const initialProfiles = normalizeAgentProfiles(options.profiles ?? [], {
     builtInModelSelectionOverrides: options.builtInModelSelectionOverrides,
   });
+  const getProfiles = () => options.getAgentDefinitions?.().activeAgents ?? initialProfiles;
   const autoBackgroundMs = normalizeAutoBackgroundMs(options.autoBackgroundMs);
 
   const port: SubagentPort & { start: NonNullable<SubagentPort["start"]> } = {
@@ -142,7 +145,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
       rawRequest: SubagentLaunchRequest,
       launchOptions?: SubagentLaunchOptions,
     ): Promise<AgentOutput> {
-      const { profile, request } = resolveAgentProfileForRequest(profiles, rawRequest);
+      const { profile, request } = resolveAgentProfileForRequest(getProfiles(), rawRequest);
       const executionRequest = toSubagentExecutionRequest(request);
       const backgroundRequested =
         rawRequest.runInBackground === true || profile.background === true;
@@ -165,6 +168,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
         return port.start(executionRequest, {
           signal: launchOptions?.signal,
           ...(launchOptions?.model ? { model: launchOptions.model } : {}),
+          ...(launchOptions?.modelOverride ? { modelOverride: launchOptions.modelOverride } : {}),
         });
       }
       return port.run(executionRequest, launchOptions);
@@ -174,7 +178,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
       rawRequest: SubagentRunRequest,
       runOptions?: SubagentRunOptions,
     ): Promise<AgentOutput> {
-      const { profile, request } = resolveAgentProfileForRequest(profiles, rawRequest);
+      const { profile, request } = resolveAgentProfileForRequest(getProfiles(), rawRequest);
       const lifecycle = createSubagentLifecycle(options, request, profile);
       const startedAt = new Date(lifecycle.startedAt);
 
@@ -201,7 +205,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
         lifecycle.agentId,
         runOptions?.signal,
       );
-      const hasForegroundModelOverride = runOptions?.modelOverride !== undefined;
+      const hasForegroundModelOverride = runOptions?.modelOverride?.background === "deny";
       if (hasForegroundModelOverride) {
         borrowedForegroundAgentIds.add(lifecycle.agentId);
       }
@@ -440,7 +444,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
       rawRequest: SubagentStartRequest,
       startOptions?: SubagentStartOptions,
     ): Promise<AgentBackgroundedOutput> {
-      const { profile, request } = resolveAgentProfileForRequest(profiles, rawRequest);
+      const { profile, request } = resolveAgentProfileForRequest(getProfiles(), rawRequest);
       const lifecycle = createSubagentLifecycle(options, request, profile);
       const startedAt = new Date(lifecycle.startedAt);
       const output = createAgentBackgroundedOutput(request, lifecycle);
@@ -475,6 +479,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
         {
           signal: taskAbort.signal,
           ...(startOptions?.model ? { model: startOptions.model } : {}),
+          ...(startOptions?.modelOverride ? { modelOverride: startOptions.modelOverride } : {}),
         },
         {
           onSessionReady: async () => {
@@ -571,7 +576,7 @@ export function createExploreSubagentPort(options: ExploreSubagentPortOptions): 
     ): Promise<SubagentSendMessageResult> {
       return sendMessageToLocalAgent(
         options,
-        profiles,
+        getProfiles,
         registry,
         abortControllers,
         request,
@@ -899,7 +904,7 @@ function createSubagentLifecycleFromTask(
 
 async function sendMessageToLocalAgent(
   options: ExploreSubagentPortOptions,
-  profiles: readonly AgentProfile[],
+  getProfiles: () => readonly AgentProfile[],
   registry: RuntimeTaskRegistry,
   abortControllers: Map<string, AbortController>,
   request: SubagentSendMessageRequest,
@@ -924,12 +929,13 @@ async function sendMessageToLocalAgent(
 
   return resumeTerminalAgentInBackground(
     options,
-    profiles,
+    getProfiles(),
     registry,
     abortControllers,
     task,
     request,
     message,
+    sendOptions,
   );
 }
 
@@ -960,6 +966,7 @@ async function resumeTerminalAgentInBackground(
   task: RuntimeTaskSnapshot,
   request: SubagentSendMessageRequest,
   message: RuntimeTaskPendingMessage,
+  sendOptions?: SubagentSendMessageOptions,
 ): Promise<SubagentSendMessageResult> {
   const profile = profiles.find((candidate) => candidate.name === task.agentType);
   if (!profile) {
@@ -1017,7 +1024,11 @@ async function resumeTerminalAgentInBackground(
     resumeRequest,
     lifecycle,
     registry,
-    { signal: taskAbort.signal },
+    {
+      signal: taskAbort.signal,
+      model: sendOptions?.model,
+      modelOverride: sendOptions?.modelOverride,
+    },
     {
       resumeFromStore: true,
       onSessionReady: async () => {
@@ -2024,8 +2035,17 @@ function aggregateModelUsage(events: SessionEvent[]): ModelUsage | undefined {
   let usage: ModelUsage | undefined;
 
   for (const event of events) {
-    if (event.type !== SessionEventType.ModelComplete) continue;
     const payload = event.payload;
+    // 与主 turn 共用失败事件的用量事实，不增加独立汇总状态。
+    if (
+      event.type !== SessionEventType.ModelComplete &&
+      !(
+        event.type === SessionEventType.ModelNetworkStatus &&
+        isRecord(payload) &&
+        payload.type === "model_request_failed"
+      )
+    )
+      continue;
     if (!isRecord(payload) || !isRecord(payload.usage)) {
       continue;
     }

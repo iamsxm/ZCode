@@ -58,6 +58,7 @@ export async function emitToolCallResult(
   display: ToolResultDisplayPayload | undefined,
   perf: ToolExecutionTelemetry | undefined,
   skillMetadata: SkillTelemetryMetadata | undefined,
+  pluginId?: string,
 ): Promise<void> {
   await deps.emitEvent({
     id: crypto.randomUUID() as any,
@@ -70,6 +71,7 @@ export async function emitToolCallResult(
     payload: {
       toolCallId: toolCall.id,
       ...(skillMetadata ? { skillMetadata } : {}),
+      ...(pluginId ? { pluginId } : {}),
       result: {
         success: true,
         content: serialization.content,
@@ -93,6 +95,7 @@ export async function emitToolCallError(
   turnId: TurnId | undefined,
   error: ToolExecutionResult["error"],
   skillMetadata?: SkillTelemetryMetadata,
+  pluginId?: string,
 ): Promise<void> {
   await deps.emitEvent({
     id: crypto.randomUUID() as any,
@@ -106,6 +109,7 @@ export async function emitToolCallError(
       toolCallId,
       error,
       ...(skillMetadata ? { skillMetadata } : {}),
+      ...(pluginId ? { pluginId } : {}),
     },
   });
 }
@@ -142,7 +146,11 @@ export async function emitPermissionRequested(
   reason: string | undefined,
   suggestedPermissionUpdates: PermissionUpdate[],
   traceContext: TraceContext,
-  approval?: { display?: ToolResultDisplayPayload; optionsPolicy?: PermissionOptionsPolicy },
+  approval?: {
+    approvalMode?: "user-once";
+    display?: ToolResultDisplayPayload;
+    optionsPolicy?: PermissionOptionsPolicy;
+  },
 ): Promise<void> {
   await deps.emitEvent({
     id: crypto.randomUUID() as any,
@@ -160,9 +168,11 @@ export async function emitPermissionRequested(
       reason: reason ?? `Tool ${toolCall.name} requires approval`,
       input,
       suggestedPermissionUpdates,
+      ...(approval?.approvalMode ? { approvalMode: approval.approvalMode } : {}),
       ...(approval?.display ? { display: approval.display } : {}),
       ...(approval?.optionsPolicy ? { optionsPolicy: approval.optionsPolicy } : {}),
-      ...(deps.sessionModePort?.supportsPermissionFullAccess?.()
+      ...(approval?.approvalMode !== "user-once" &&
+      deps.sessionModePort?.supportsPermissionFullAccess?.()
         ? { fullAccessSupported: true }
         : {}),
     },

@@ -34,6 +34,8 @@ import {
   getSessionShellSelection,
   restoreSessionShellEnvironmentSelectionForResume,
 } from "./session-shell-environment.js";
+import { resetProjectMemoryRecall } from "../helpers/project-memory-recall.js";
+import { restoreDynamicWorkflowActivationOnResume } from "./dynamic-workflow-activation.js";
 import { repairPersistedRemoteSessionPaths } from "../helpers/persisted-remote-session-path-repair.js";
 import {
   restoreWorkspaceCheckpointEntries,
@@ -70,7 +72,9 @@ export async function resumeFromStore(
 
   const traceContext = options?.traceContext ?? this.rootTraceContext;
   const persistedSession = await this.sessionStore.getSession(this.sessionId);
-  if (!persistedSession || persistedSession.time.archived !== undefined) {
+  // 删除 = CLI 软删除（time_deleted）。归档已归 Host 组织态，CLI 不再有归档列；
+  // 旧的 time.archived 判断永远为 false，这里改为拒绝恢复已软删除的会话。
+  if (!persistedSession || persistedSession.time.deleted !== undefined) {
     throw createCoreError(CoreErrorType.SessionNotFound, `Session not found: ${this.sessionId}`, {
       context: { sessionId: this.sessionId },
       recoverable: true,
@@ -128,6 +132,7 @@ export async function resumeFromStore(
       ? String(session.workspaceID)
       : undefined;
   }
+  resetProjectMemoryRecall(this);
   this.messageHistory = new MessageHistoryImpl();
   this.contextBuilder = null;
   this.contextInitialized = false;
@@ -150,6 +155,7 @@ export async function resumeFromStore(
     traceContext,
   );
   const hydration = await hydrateMessageHistoryFromSession({
+    logger: this.logger,
     artifactStore: this.artifactStore,
     branchCutAfterMessageId,
     history: this.messageHistory,
@@ -214,6 +220,9 @@ export async function resumeFromStore(
   if (savedExecution.success && options?.modeOverride === undefined) {
     Object.assign(this.config, savedExecution.data);
   }
+  // onDemand 会话的工具面随记录恢复（launch.md「On demand: activation」）：entry 在场，或历史里
+  // 有过 `/workflow` / 十个工具的调用。要在首轮之前完成，所以放在 resume 里而不是等下一次 turn。
+  await restoreDynamicWorkflowActivationOnResume.call(this, messages);
 
   await restorePermissionGrantMarker(this, traceContext);
 

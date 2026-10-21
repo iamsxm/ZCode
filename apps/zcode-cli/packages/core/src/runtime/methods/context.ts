@@ -18,6 +18,10 @@ import type { AgentRuntimeInternal } from "../internal.js";
 import { ensureMemoryDirectoryExists } from "../../memory/directory.js";
 import { formatProjectMemoryIndexContent } from "../../memory/index-content.js";
 import {
+  ACTIVE_PROJECT_MEMORY_RETRIEVAL_BRANCH,
+  type ProjectMemoryRetrievalBranch,
+} from "../../memory/project-memory-retrieval-branch.js";
+import {
   createReadFileStateKey,
   normalizeReadFileStateMtimeMs,
 } from "../../tool/read-file-state.js";
@@ -25,6 +29,10 @@ import { resolveEnabledProjectMemoryRoot } from "../helpers/project-memory.js";
 import { buildContextHistoryEntries } from "./context-history-entries.js";
 import { resolveRuntimeEmbeddedSearchEnabled } from "./embedded-search-branch.js";
 import { getContextSourceShellDisplayName } from "./session-shell-environment.js";
+import {
+  ensureGenUiOutputDirectory,
+  resolveGenUiOutputDirectory,
+} from "../helpers/gen-ui-output.js";
 
 export { buildContextHistoryEntries };
 
@@ -64,12 +72,21 @@ export async function ensureContextInitialized(
   this.startMcpStartup(traceContext);
   this.skillLoadOutcome = await this.discoverSkillsForContext(traceContext);
   this.memoryRoot = await this.loadProjectMemoryRoot(traceContext);
-  this.memoryIndexContent = await loadProjectMemoryIndexContent(this, this.memoryRoot);
+  this.memoryIndexContent = await loadProjectMemoryIndexContent(
+    this,
+    this.memoryRoot,
+    ACTIVE_PROJECT_MEMORY_RETRIEVAL_BRANCH,
+  );
+  await ensureGenUiOutputDirectory(this);
   this.contextBuilder = this.createContextBuilderFromSnapshot(snapshot, this.memoryRoot, {
     memoryIndexContent: this.memoryIndexContent,
     model,
   });
+  // Bug 根因：模型创建失败轮会在 Context 首次可初始化前接纳并持久化用户输入。
+  // init 会替换全部内存历史，因此先保留这些权威运行条目，再接到新建的 Context 前缀之后。
+  const preContextEntries = [...this.messageHistory.borrowReadOnlyRuntimeEntries()];
   this.initializeMessageHistoryFromContext(this.contextBuilder, traceContext);
+  this.messageHistory.addEntries(preContextEntries);
   this.contextInitialized = true;
 }
 
@@ -121,9 +138,11 @@ export function createContextBuilderFromSnapshot(
 
   const contextConfig: ContextBuilderConfig = {
     workingDirectory: snapshot.workingDirectory,
+    additionalDirectories: this.config.additionalDirectories,
     envInfo,
     model: options.model,
     presentationSurface: this.config.presentationSurface,
+    genUiOutputDirectory: resolveGenUiOutputDirectory(this),
     currentDate: snapshot.currentDate,
     userInstructions: snapshot.userInstructions,
     projectContext: snapshot.projectContext,
@@ -165,10 +184,12 @@ export async function loadProjectMemoryRoot(
   return memoryRoot;
 }
 
-async function loadProjectMemoryIndexContent(
+export async function loadProjectMemoryIndexContent(
   runtime: AgentRuntimeInternal,
   memoryRoot: string | undefined,
+  retrievalBranch: ProjectMemoryRetrievalBranch,
 ): Promise<string | undefined> {
+  if (retrievalBranch !== "default-index") return undefined;
   const fileSystemPort = runtime.fileSystemPort;
   if (!fileSystemPort || !memoryRoot) return undefined;
   const indexPath = join(memoryRoot, "MEMORY.md");

@@ -1,15 +1,20 @@
-import { createUuid } from "@zcode/shared";
+import {
+  createUuid,
+  CONVERSATION_SELECTION_MAX_TEXT_LENGTH,
+  CONVERSATION_SELECTION_MAX_COUNT,
+  CONVERSATION_SELECTION_MAX_TOTAL_LENGTH,
+  type ConversationSelectionText,
+} from "@zcode/shared";
 
-export const CONVERSATION_SELECTION_MAX_TEXT_LENGTH = 8_000;
-const CONVERSATION_SELECTION_MAX_COUNT = 8;
-const CONVERSATION_SELECTION_MAX_TOTAL_LENGTH = 16_000;
+export {
+  buildPromptWithConversationSelections,
+  CONVERSATION_SELECTION_MAX_TEXT_LENGTH,
+  CONVERSATION_SELECTION_MAX_COUNT,
+  CONVERSATION_SELECTION_MAX_TOTAL_LENGTH,
+  type ConversationSelectionText,
+} from "@zcode/shared";
 
 export type ConversationSelectionContentType = "user" | "assistant" | "reasoning" | "tool";
-
-export interface ConversationSelectionText {
-  text: string;
-  path?: string;
-}
 
 export interface MessageSelectionReference extends ConversationSelectionText {
   id: string;
@@ -30,6 +35,7 @@ export type ConversationSelectionReference = MessageSelectionReference | Markdow
 export interface MarkdownSelectionTarget {
   sessionId: string | null;
   workspaceKey: string;
+  draftScopeKey?: string;
 }
 
 export type ConversationSelectionDisplayReference =
@@ -38,13 +44,14 @@ export type ConversationSelectionDisplayReference =
 
 interface ConversationSelectionAddEventDetail {
   targetSessionId: string | null;
+  draftScopeKey?: string;
   workspaceKey: string;
   reference: ConversationSelectionReference;
   result?: ConversationSelectionAppendResult;
 }
 
 export type ConversationSelectionLimitReason = "count" | "single" | "total";
-type ConversationSelectionAppendResult =
+export type ConversationSelectionAppendResult =
   | {
       ok: true;
       references: readonly ConversationSelectionReference[];
@@ -59,23 +66,29 @@ const LEGACY_BLOCK_PATTERN =
 const referencesByScope = new Map<string, readonly ConversationSelectionReference[]>();
 const limitReasonByScope = new Map<string, ConversationSelectionLimitReason>();
 
-function referenceScopeKey(sessionId: string | null, workspaceKey: string): string {
-  return `${workspaceKey}\0${sessionId ?? "__draft__"}`;
+function referenceScopeKey(
+  sessionId: string | null,
+  workspaceKey: string,
+  draftScopeKey?: string,
+): string {
+  return `${workspaceKey}\0${sessionId ?? (draftScopeKey ? `__draft__:${draftScopeKey}` : "__draft__")}`;
 }
 
 export function getConversationSelectionReferenceScope(
   sessionId: string | null,
   workspaceKey: string,
+  draftScopeKey?: string,
 ): readonly ConversationSelectionReference[] {
-  return referencesByScope.get(referenceScopeKey(sessionId, workspaceKey)) ?? [];
+  return referencesByScope.get(referenceScopeKey(sessionId, workspaceKey, draftScopeKey)) ?? [];
 }
 
 export function setConversationSelectionReferenceScope(
   sessionId: string | null,
   workspaceKey: string,
   references: readonly ConversationSelectionReference[],
+  draftScopeKey?: string,
 ): void {
-  const key = referenceScopeKey(sessionId, workspaceKey);
+  const key = referenceScopeKey(sessionId, workspaceKey, draftScopeKey);
   if (references.length > 0) referencesByScope.set(key, references);
   else referencesByScope.delete(key);
   limitReasonByScope.delete(key);
@@ -84,8 +97,9 @@ export function setConversationSelectionReferenceScope(
 export function getConversationSelectionReferenceLimitReason(
   sessionId: string | null,
   workspaceKey: string,
+  draftScopeKey?: string,
 ): ConversationSelectionLimitReason | null {
-  return limitReasonByScope.get(referenceScopeKey(sessionId, workspaceKey)) ?? null;
+  return limitReasonByScope.get(referenceScopeKey(sessionId, workspaceKey, draftScopeKey)) ?? null;
 }
 
 export function clearConversationSelectionReferenceScope(
@@ -99,8 +113,9 @@ export function clearConversationSelectionReferenceScope(
 export function clearConversationSelectionReferenceLimitReason(
   sessionId: string | null,
   workspaceKey: string,
+  draftScopeKey?: string,
 ): void {
-  limitReasonByScope.delete(referenceScopeKey(sessionId, workspaceKey));
+  limitReasonByScope.delete(referenceScopeKey(sessionId, workspaceKey, draftScopeKey));
 }
 
 export function createConversationSelectionReference(
@@ -109,7 +124,9 @@ export function createConversationSelectionReference(
   return { ...input, id: createUuid() };
 }
 
-function getConversationSelectionDedupeKey(reference: ConversationSelectionReference): string {
+export function getConversationSelectionDedupeKey(
+  reference: ConversationSelectionReference,
+): string {
   if (reference.contentType === "markdown") {
     return ["markdown", reference.sourceKey, reference.text].join("\0");
   }
@@ -121,7 +138,7 @@ function getConversationSelectionDedupeKey(reference: ConversationSelectionRefer
   ].join("\0");
 }
 
-function appendConversationSelectionReference(
+export function appendConversationSelectionReference(
   current: readonly ConversationSelectionReference[],
   reference: ConversationSelectionReference,
 ): ConversationSelectionAppendResult {
@@ -140,21 +157,6 @@ function appendConversationSelectionReference(
     return { ok: false, reason: "total" };
   }
   return { ok: true, references: [...current, reference], duplicate: false };
-}
-
-export function buildPromptWithConversationSelections(
-  visibleContent: string,
-  references: readonly ConversationSelectionDisplayReference[],
-): string {
-  if (references.length === 0) return visibleContent;
-  // 文件选段曾只发正文，导致模型与历史丢失文件来源；只保留路径，不发送内部身份字段。
-  const block = [
-    "# userselect:",
-    "```userselect",
-    JSON.stringify(references.map(({ text, path }) => (path?.trim() ? { path, text } : { text }))),
-    "```",
-  ].join("\n");
-  return visibleContent ? `${visibleContent}\n\n${block}` : block;
 }
 
 export function parsePromptConversationSelections(text: string): {
@@ -205,6 +207,7 @@ export function dispatchConversationSelectionAdd(
   const current = getConversationSelectionReferenceScope(
     detail.targetSessionId,
     detail.workspaceKey,
+    detail.draftScopeKey,
   );
   const result = appendConversationSelectionReference(current, detail.reference);
   if (result.ok) {
@@ -212,10 +215,11 @@ export function dispatchConversationSelectionAdd(
       detail.targetSessionId,
       detail.workspaceKey,
       result.references,
+      detail.draftScopeKey,
     );
   } else {
     limitReasonByScope.set(
-      referenceScopeKey(detail.targetSessionId, detail.workspaceKey),
+      referenceScopeKey(detail.targetSessionId, detail.workspaceKey, detail.draftScopeKey),
       result.reason,
     );
   }

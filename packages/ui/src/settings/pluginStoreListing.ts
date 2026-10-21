@@ -11,11 +11,13 @@ import {
   compareDocumentPluginPriority,
   resolvePluginStoreCategory as resolveStoreCategory,
   FALLBACK_PLUGIN_STORE_CATEGORY as FALLBACK_CATEGORY,
+  formatCanonicalPluginName,
   isPublicStoreMarketplaceId,
   resolveLocalizedText,
   resolvePluginDisplayName,
   ZCODE_OFFICIAL_PLUGIN_MARKETPLACE_ID,
 } from "@zcode/shared";
+import { DEFAULT_MARKETPLACE_ID } from "@/settings/recommendedPlugins.js";
 import { pluginSearchMatches } from "@/settings/pluginSearch.js";
 
 export {
@@ -24,8 +26,8 @@ export {
   resolvePluginDisplayName,
 } from "@zcode/shared";
 
-export { isTrustedImageUrl } from "@/lib/trustedImageUrl.js";
 export { isPublicStoreMarketplaceId };
+export { isTrustedImageUrl } from "@/lib/trustedImageUrl.js";
 
 /**
  * 仅在名称唯一时允许从目录条目回退解析 listing。
@@ -67,6 +69,27 @@ export interface StorePluginItem {
   installedMeta?: ZCodeInstalledPluginSummary;
 }
 
+// 市场和右侧推荐共用按插件的忙碌判定，避免安装一个插件时禁用整个推荐列表。
+export function isItemBusy(
+  item: StorePluginItem,
+  actions: { activeOperations: ReadonlyArray<{ id: string }>; togglingPluginId: string | null },
+): boolean {
+  return (
+    actions.activeOperations.some(
+      (operation) => operation.id === `plugin:install:${item.name}@${item.marketplace}`,
+    ) ||
+    actions.activeOperations.some((operation) => operation.id === `plugin:restore:${item.id}`) ||
+    actions.activeOperations.some((operation) => operation.id === `plugin:uninstall:${item.id}`) ||
+    actions.activeOperations.some((operation) => operation.id === `plugin:update:${item.id}`) ||
+    actions.activeOperations.some(
+      (operation) => operation.id === `plugin:reset-config:${item.id}`,
+    ) ||
+    // 保存配置也是同插件写操作；漏掉它时恢复默认、更新可在保存期间被点击。
+    actions.activeOperations.some((operation) => operation.id === `plugin:configure:${item.id}`) ||
+    actions.togglingPluginId === item.id
+  );
+}
+
 export type PluginUpdateStatus = NonNullable<ZCodeInstalledPluginSummary["updateStatus"]>;
 
 export function isPluginUpdatePending(
@@ -100,6 +123,10 @@ export function resolveLocalizedList(
     }
   }
   return base && base.length > 0 ? base : undefined;
+}
+
+export function formatCanonicalMarketplaceName(name: string, locale: string): string {
+  return formatCanonicalPluginName(name, locale);
 }
 
 export function resolveItemDisplayName(item: StorePluginItem, locale: string): string {
@@ -137,14 +164,29 @@ export const KNOWN_CATEGORY_LABEL_IDS: Record<string, string> = {
 };
 
 export {
+  resolvePluginStoreCategory as resolveStoreCategory,
   FALLBACK_PLUGIN_STORE_CATEGORY as FALLBACK_CATEGORY,
   PLUGIN_STORE_CATEGORY_ORDER as KNOWN_CATEGORY_ORDER,
-  resolvePluginStoreCategory as resolveStoreCategory,
 } from "@zcode/shared";
 
-interface StoreCategoryGroup {
+export interface StoreCategoryGroup {
   category: string;
   items: StorePluginItem[];
+}
+
+export type PluginStoreSegment = "public" | "community" | "personal";
+
+export function resolvePluginStoreSegment(item: StorePluginItem): PluginStoreSegment {
+  if (!isPublicStoreMarketplaceId(item.marketplace)) return "personal";
+  return item.listing?.publisherType === "community" ? "community" : "public";
+}
+
+export function isUiPluginItem(item: StorePluginItem): boolean {
+  // 已安装清单优先于目录宣传；禁用仍保留经过校验的 surface 元数据。
+  if (item.info) return Boolean(item.info.uiSurfaces?.length);
+  return Boolean(
+    (item.installedMeta?.componentTypes ?? item.summary?.componentTypes)?.includes("ui"),
+  );
 }
 
 /** 个人分段的市场分组：marketplace 是排序键，title 是展示名。 */
@@ -154,7 +196,10 @@ export interface PersonalMarketplaceGroup {
   items: StorePluginItem[];
 }
 
-const OFFICIAL_MARKETPLACE_ORDER: readonly string[] = [ZCODE_OFFICIAL_PLUGIN_MARKETPLACE_ID];
+const OFFICIAL_MARKETPLACE_ORDER = [
+  ZCODE_OFFICIAL_PLUGIN_MARKETPLACE_ID,
+  DEFAULT_MARKETPLACE_ID,
+] as const;
 
 /**
  * 市场源管理排序：官方源固定置顶；自定义源按最近刷新时间倒序，未刷新过的沉底。

@@ -7,6 +7,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button.js";
+import { Switch } from "@/components/ui/switch.js";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -18,6 +19,8 @@ import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { PluginStoreAvatar } from "@/settings/PluginStoreAvatar.js";
 import {
   canUpdatePluginItem,
+  isItemBusy,
+  isUiPluginItem,
   resolveItemDescription,
   resolveItemDisplayName,
   type StorePluginItem,
@@ -27,6 +30,7 @@ import { runUserAction } from "@/lib/userActionTelemetry.js";
 /** 商店条目的通用动作集：列表卡片、详情页共用同一套回调与进行中态判定。 */
 export interface PluginStoreActions {
   onOpenDetail: (pluginId: string) => void;
+  onOpenUi?: (item: StorePluginItem) => void;
   /** 安装或恢复（restorable 内置插件走 restoreBuiltin，其余走 install）。 */
   onInstall: (item: StorePluginItem) => void;
   onUninstall: (pluginId: string) => void;
@@ -34,19 +38,8 @@ export interface PluginStoreActions {
   /** 删除当前 Workspace scope 的显式配置，使其回退到 User。 */
   onResetConfig?: (pluginId: string) => void;
   onUpdate: (pluginId: string) => void;
-  operationId: string | null;
+  activeOperations: ReadonlyArray<{ id: string }>;
   togglingPluginId: string | null;
-}
-
-function isItemBusy(item: StorePluginItem, actions: PluginStoreActions): boolean {
-  return (
-    actions.operationId === `plugin:install:${item.name}@${item.marketplace}` ||
-    actions.operationId === `plugin:restore:${item.id}` ||
-    actions.operationId === `plugin:uninstall:${item.id}` ||
-    actions.operationId === `plugin:update:${item.id}` ||
-    actions.operationId === `plugin:reset-config:${item.id}` ||
-    actions.togglingPluginId === item.id
-  );
 }
 
 /**
@@ -58,6 +51,34 @@ export function PluginStorePaidPlanBadge({
   item: Pick<StorePluginItem, "id" | "listing">;
 }) {
   return null;
+}
+
+/** 详情页与管理视图的插件级启停开关；紧凑商店卡片只保留「…」菜单。 */
+export function PluginStoreEnabledSwitch({
+  item,
+  actions,
+}: {
+  item: StorePluginItem;
+  actions: PluginStoreActions;
+}) {
+  const { intl } = useZCodeIntl();
+  if (!item.info || !actions.onSetEnabled) return null;
+  const enabled = item.info.enabled;
+  return (
+    <Switch
+      data-testid="plugin-store-enabled-switch"
+      data-plugin-id={item.id}
+      checked={enabled}
+      disabled={actions.togglingPluginId === item.id}
+      aria-label={
+        enabled
+          ? intl.formatMessage({ id: "settings.plugins.store.menu.disable" })
+          : intl.formatMessage({ id: "settings.plugins.store.menu.enable" })
+      }
+      onClick={(event) => event.stopPropagation()}
+      onCheckedChange={(checked) => actions.onSetEnabled?.(item.id, checked)}
+    />
+  );
 }
 
 /** 已安装条目的「…」菜单：启用/禁用、更新（有更新时）、卸载。卡片与详情页共用。 */
@@ -76,13 +97,11 @@ export function PluginStoreItemMenu({
 }) {
   const { intl } = useZCodeIntl();
   const enabled = item.info?.enabled ?? false;
-  const updatePending = canUpdatePluginItem(item);
   const busy = isItemBusy(item, actions);
   const canToggleEnabled = Boolean(item.info && actions.onSetEnabled);
   // 分隔线不应跟随 item.installed 无条件渲染；启停/更新/恢复配置都不出现时，
   // 菜单只剩「卸载」一项，上方却留下一条孤立横线。分隔线只在卸载前确有其他操作项时才有意义。
-  const hasActionsBeforeUninstall =
-    canToggleEnabled || updatePending || Boolean(actions.onResetConfig);
+  const hasActionsBeforeUninstall = canToggleEnabled;
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
@@ -121,27 +140,6 @@ export function PluginStoreItemMenu({
               : intl.formatMessage({ id: "settings.plugins.store.menu.enable" })}
           </DropdownMenuItem>
         ) : null}
-        {updatePending ? (
-          <DropdownMenuItem
-            data-testid="plugin-store-menu-update"
-            data-plugin-id={item.id}
-            disabled={busy}
-            onSelect={() => actions.onUpdate(item.id)}
-          >
-            <Download className="size-4" aria-hidden="true" />
-            {intl.formatMessage({ id: "settings.plugins.detail.update" })}
-          </DropdownMenuItem>
-        ) : null}
-        {actions.onResetConfig ? (
-          <DropdownMenuItem
-            data-testid="plugin-store-menu-reset-config"
-            data-plugin-id={item.id}
-            disabled={busy}
-            onSelect={() => actions.onResetConfig?.(item.id)}
-          >
-            {intl.formatMessage({ id: "settings.plugins.store.menu.resetConfig" })}
-          </DropdownMenuItem>
-        ) : null}
         {item.installed ? (
           <>
             {hasActionsBeforeUninstall ? <DropdownMenuSeparator /> : null}
@@ -174,8 +172,9 @@ export function PluginStoreInstallButton({
 }) {
   const { intl } = useZCodeIntl();
   const installing =
-    actions.operationId === `plugin:install:${item.name}@${item.marketplace}` ||
-    actions.operationId === `plugin:restore:${item.id}`;
+    actions.activeOperations.some(
+      (operation) => operation.id === `plugin:install:${item.name}@${item.marketplace}`,
+    ) || actions.activeOperations.some((operation) => operation.id === `plugin:restore:${item.id}`);
   return (
     <Button
       type="button"
@@ -237,7 +236,9 @@ export function PluginStoreUpdateButton({
 }) {
   const { intl } = useZCodeIntl();
   if (!item || !canUpdatePluginItem(item)) return null;
-  const updating = actions.operationId === `plugin:update:${item.id}`;
+  const updating = actions.activeOperations.some(
+    (operation) => operation.id === `plugin:update:${item.id}`,
+  );
   return (
     <Button
       type="button"
@@ -246,7 +247,8 @@ export function PluginStoreUpdateButton({
       variant="secondary"
       size={size}
       className="rounded-full"
-      disabled={actions.operationId !== null}
+      // 与安装按钮一致按插件判定：A 安装中时 B 仍可提交更新，后端按提交顺序串行执行。
+      disabled={isItemBusy(item, actions)}
       onClick={(event) => {
         event.stopPropagation();
         actions.onUpdate(item.id);
@@ -278,6 +280,8 @@ export function PluginStoreCard({
   const { intl } = useZCodeIntl();
   const displayName = resolveItemDisplayName(item, locale);
   const description = resolveItemDescription(item, locale);
+  // 卡片整行统一进入详情；打开 UI 只走会话右侧市场提供的「打开」按钮。
+  const open = () => actions.onOpenDetail(item.id);
   return (
     <div
       role="button"
@@ -285,11 +289,12 @@ export function PluginStoreCard({
       data-testid="plugin-store-card"
       data-plugin-id={item.id}
       className="group/card flex min-w-0 cursor-pointer items-center gap-3 rounded-xl px-2 py-2.5 transition-colors hover:bg-hover focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-input-border-focused"
-      onClick={() => actions.onOpenDetail(item.id)}
+      onClick={open}
       onKeyDown={(event) => {
+        if (event.target !== event.currentTarget) return;
         if (event.key === "Enter" || event.key === " ") {
           event.preventDefault();
-          actions.onOpenDetail(item.id);
+          open();
         }
       }}
     >
@@ -321,8 +326,9 @@ export function PluginStoreCard({
       <div className="flex shrink-0 items-center gap-1.5">
         {item.installed ? (
           <>
+            <PluginStoreOpenUiButton item={item} actions={actions} />
             <PluginStoreUpdateButton item={item} actions={actions} />
-            {/* 旧版误写 suppression 后可能只剩安装记录、没有运行时 info；
+            {/* Bugfix：旧版误写 suppression 后可能只剩安装记录、没有运行时 info；
                 此时仍须保留卸载菜单，让用户能清理安装记录与脏 suppression。 */}
             <PluginStoreItemMenu item={item} actions={actions} />
           </>
@@ -331,5 +337,37 @@ export function PluginStoreCard({
         )}
       </div>
     </div>
+  );
+}
+
+export function PluginStoreOpenUiButton({
+  item,
+  actions,
+}: {
+  item: StorePluginItem;
+  actions: PluginStoreActions;
+}) {
+  const { intl } = useZCodeIntl();
+  if (!item.installed || !isUiPluginItem(item) || !actions.onOpenUi) return null;
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant="secondary"
+      data-testid="plugin-store-open-ui"
+      data-plugin-id={item.id}
+      disabled={isItemBusy(item, actions)}
+      onClick={(event) => {
+        event.stopPropagation();
+        actions.onOpenUi?.(item);
+      }}
+    >
+      {intl.formatMessage({
+        id:
+          (item.info?.enabled ?? item.installedMeta?.enabled)
+            ? "settings.plugins.store.ui.open"
+            : "settings.plugins.store.menu.enable",
+      })}
+    </Button>
   );
 }

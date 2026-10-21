@@ -81,10 +81,10 @@ export interface ConversationPromptTelemetrySeed {
   queueConfirmed?: boolean;
 }
 
-/** 发送落定的失败原因。 */
-type ConversationSendFailureReason = SendFunnelReasonCode;
+/** 发送落定的失败原因，取值口径见 docs/monitoring/composer-send-funnel-telemetry.md。 */
+export type ConversationSendFailureReason = SendFunnelReasonCode;
 
-interface AcceptedConversationPromptTelemetrySeed extends ConversationPromptTelemetrySeed {
+export interface AcceptedConversationPromptTelemetrySeed extends ConversationPromptTelemetrySeed {
   /** CLI 会话记录的开关；缺失保持未知，不能用实时设置补齐。 */
   memoryEnabled?: boolean;
   sessionId: string;
@@ -97,13 +97,13 @@ interface AcceptedConversationPromptTelemetrySeed extends ConversationPromptTele
 const HELD_QUEUE_CONFIRMATION_STALE_REASON = "guard.heldQueueConfirmationStale";
 
 /** 从点击发送起算，超过这个时长仍未渲染出用户消息就判超时。 */
-const SEND_RENDER_WAIT_TIMEOUT_MS = 30_000;
+export const SEND_RENDER_WAIT_TIMEOUT_MS = 30_000;
 
 /**
  * ACK 的处置：要么转入待渲染等待（命令被受理，但用户消息还没画出来），
  * 要么立即落定为失败。返回 null 表示本次两者都不做。
  */
-type ConversationSendAckOutcome =
+export type ConversationSendAckOutcome =
   | { kind: "awaitRender"; ackStatus: string }
   | {
       kind: "settle";
@@ -297,7 +297,7 @@ interface DeferredTerminal {
   foregroundAtReceipt: boolean;
 }
 
-interface ConversationTelemetryWorkspaceDetail {
+export interface ConversationTelemetryWorkspaceDetail {
   workspace_kind: "local" | "remote";
   remote_kind: RemoteWorkspaceIdentityKind | "";
 }
@@ -428,8 +428,14 @@ function toToolLifecycleEvent(input: {
 }): ZCodeStreamEvent {
   const { fact } = input;
   const skillMetadata =
-    fact.skillQualifiedName || fact.skillPluginId || fact.skillSource
+    fact.skillName || fact.skillQualifiedName || fact.skillPluginId || fact.skillSource
       ? {
+          // 旧 CLI 的 scheduled 名称来自任意请求；只接受带解析来源的终态名称。
+          ...(fact.skillName &&
+          fact.skillSource &&
+          (fact.phase === "completed" || fact.phase === "failed")
+            ? { name: fact.skillName }
+            : {}),
           ...(fact.skillQualifiedName ? { qualifiedName: fact.skillQualifiedName } : {}),
           ...(fact.skillPluginId ? { pluginId: fact.skillPluginId } : {}),
           ...(fact.skillSource ? { source: fact.skillSource } : {}),
@@ -465,6 +471,9 @@ function toToolLifecycleEvent(input: {
     error: fact.errorMessage,
     raw: {},
     ...(skillMetadata ? { skillMetadata } : {}),
+    ...(fact.pluginId
+      ? { pluginMetadata: { pluginId: fact.pluginId, component: "mcp" as const } }
+      : {}),
   } as Extract<ZCodeStreamEvent, { type: "tool_call_update" }>;
 }
 

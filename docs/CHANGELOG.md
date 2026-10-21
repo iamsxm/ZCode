@@ -2,6 +2,30 @@
 
 本文件记录项目中可复用的产品行为和运行时集成变更。设计背景与详细协议请参阅对应的 spec 文档。
 
+## 2026-10-21
+
+### 合并原始仓库 main
+
+- 上游：`zai-org/ZCode`，合入 `aac47556`、`0a1fc56d`、`3c5b2276`，版本从 `3.14.3` 更新为 `3.16.2`。合并前 fork 基线为 `ddeb790`；10 月 21 日再次核对上游 main 仍为 `3c5b2276`。
+- 逐项解决 15 个文件的三方合并冲突，保留 fork 的 GitHub Releases 更新源、发布版本覆盖、产品命名、界面定制和外部 Computer Use Helper 接线。
+- 官方插件统一使用上游 `apps/zcode-cli/packages/*-plugin`，移除 12 个旧目录副本及旧发现路径，避免同名 workspace 包与重复 staging。
+- 保留 GitHub Issues 问题上报、隐藏社区/需求入口和 Z.ai 登录的既有行为，同时接入上游漏洞上报入口；相应上游测试按 fork 规则整合。
+- 修复整合后的构建缓存遗漏：`ZCODE_APP_VERSION` 纳入桌面 E2E 构建指纹，避免版本变化后复用旧产物。
+
+### 验证与限制
+
+- 环境：Windows，Node `24.14.0`，pnpm `10.33.2`；`pnpm install --frozen-lockfile` 成功。
+- `pnpm typecheck` 通过；`pnpm lint` 为 99 个警告、0 个错误；`pnpm architecture:check --changed` 为 0 个违规。合并前 Lint 为 82 个警告、0 个错误。
+- `pnpm --dir apps/zcode-cli typecheck` 通过（32 个任务）；CLI Lint 为 0 个错误、70 个警告，另有 13 个原样上游行数诊断。Windows 下执行 CLI 命令时将根 `node_modules/.bin` 加入当前进程 PATH。
+- 根定向单测共 128 项通过，涉及 `workspaceHelpMenuButton`、`loginDialogProviders`、`modelProviderNavigationLoading`、`modelProviderNavigationI18n`、`workspaceSidebarFooterUsageSummaryEntitlement`、`workspaceSidebarFooterWebRemoteControlTooltip`、`autoUpdaterReadyState`、`e2eDesktopBuildCache`。命令为 `pnpm exec vitest run <对应 packages/ui/test 或 packages/desktop/test 文件>`。
+- CLI 插件定向单测 23 项通过、3 项失败：`bundled-plugins-resilience.test.ts` 的 2 项缓存诊断断言在恢复原样上游实现后仍失败；`official-plugin-runtime.test.ts` 的 1 项断言因 Windows 路径中 `/` 与 `\\` 表示不同而失败，相关实现和测试均未修改。另运行 `official-plugin-seed-lock.test.ts`、`official-plugin-cache-fs.test.ts` 通过。未将这些失败记为通过。
+- `pnpm --filter @zcode/desktop typecheck:e2e` 通过；修改的 E2E 文件 Lint 为 0 个警告、0 个错误。
+- 桌面帮助菜单 E2E 最终为 1 项通过、2 项失败：VR-02 窄窗、中英文及深浅主题通过；VR-01 刷新后工作区未就绪，诊断显示登录页；VR-03 冷缓存占位的 `aria-disabled` 预期为 `true`、实际为 `null`。失败原因尚未确认，不能据此判定均为上游或环境问题。运行记录为 `desktop-e2e-20261021003444818-p31448-e9d6c8de0c10bff3`，报告位于 `packages/desktop/.e2e-artifacts/<运行记录>/summary.md`。测试保留 pending 状态，未转正。
+- E2E 复现：先设置 `E2E_PROVIDER_HTTP_MODE=replay`，将 `E2E_PROVIDER_REPLAY_FIXTURE_PATH` 设为 `packages/desktop/test/e2e/fixtures/upstream/common.json` 的绝对路径，再执行 `pnpm --filter @zcode/desktop test:e2e -- --spec test/e2e/manual-review/pending/help-report-vulnerability.test.ts`。默认 capture 首轮因缺少 `E2E_PROVIDER_BASE_URL` 在测试前失败，未计入通过结果。
+- 未执行全量单测、完整跨平台打包或真实 Computer Use 原生交互验证。原样合入的上游文件包含空白诊断，未全仓格式化；本次相对上游的整合差异通过 `git diff --check FETCH_HEAD`。
+
+详细范围：[`2026-10-20-upstream-main-merge.md`](superpowers/specs/2026-10-20-upstream-main-merge.md)。
+
 ## 2026-09-22
 
 ### Computer Use broker runtime 恢复

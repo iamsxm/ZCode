@@ -25,6 +25,7 @@ export interface AutomationRunsEntry {
 export type AutomationRunNowResult = "queued" | "duplicate" | "failed";
 
 export interface CreateAutomationInput {
+  projectId?: string | null;
   title: string;
   cronExpr: string;
   prompt: string;
@@ -52,7 +53,7 @@ export interface UpdateAutomationInput {
   scheduleEditedByUser?: boolean;
 }
 
-interface AutomationManagementState {
+export interface AutomationManagementState {
   workspacePath: string | null;
   workspaceIdentity: string | null;
   automations: ZCodeAutomation[];

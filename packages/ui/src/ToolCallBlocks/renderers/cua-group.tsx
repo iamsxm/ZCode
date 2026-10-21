@@ -6,7 +6,6 @@ import {
   resolveVerticalScrollMaskState,
   type ScrollMaskState,
 } from "@/mentions/components/scrollMask.js";
-import { ToolCallBlock } from "@/ToolCallBlocks.js";
 import { ToolLayout } from "@/ToolCallBlocks/ToolLayout.js";
 import { buildCuaSummaryPresentation } from "@/ToolCallBlocks/renderers/cua.js";
 import { CUA_TOOL_ICON } from "@/ToolCallBlocks/renderers/cuaIcon.js";
@@ -16,11 +15,11 @@ import type { ConversationCuaGroupEvent } from "@/v4/conversationCuaGroups.js";
 const TERMINAL_CUA_STATUSES = new Set(["completed", "failed", "stopped"]);
 const STICK_TO_BOTTOM_THRESHOLD_PX = 8;
 
-function scrollCuaGroupToBottom(viewport: Pick<HTMLElement, "scrollHeight" | "scrollTop">) {
+export function scrollCuaGroupToBottom(viewport: Pick<HTMLElement, "scrollHeight" | "scrollTop">) {
   viewport.scrollTop = viewport.scrollHeight;
 }
 
-function isCuaGroupViewportAtBottom(
+export function isCuaGroupViewportAtBottom(
   viewport: Pick<HTMLElement, "clientHeight" | "scrollHeight" | "scrollTop">,
 ) {
   return (
@@ -48,6 +47,7 @@ function CuaGroupChildren({
   renderAssistantMessage?: CuaGroupRenderProps["renderAssistantMessage"];
   renderReasoning?: CuaGroupRenderProps["renderReasoning"];
 }) {
+  const ToolCallBlock = context.nestedToolRenderer;
   const viewportRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const shouldStickToBottomRef = useRef(true);

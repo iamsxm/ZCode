@@ -4,8 +4,10 @@ import {
   getModelProviderFamilySpec,
   resolveModelProviderFamilyIdByProviderId,
 } from "@zcode/shared";
-import { thoughtLevelLabelId } from "@/chat-input-toolbar/thoughtLevelOptions.js";
-import { useWorkflowSubagentModelProviderName } from "@/hooks/useWorkflowSubagentModelProviderName.js";
+// 分享页通过 ToolPresentation 复用本渲染器；从 thoughtLevelOptions 引入会经 display → CodingPlan 拉进
+// @zcode/provider 闭包，导致 web-share 构建失败，因此直接依赖纯词表模块。
+import { thoughtLevelLabelId } from "@/chat-input-toolbar/thoughtLevelLabels.js";
+import { useToolPresentationCapabilities } from "@/ToolCallBlocks/presentationCapabilities.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { ToolSnapshotFieldNotice } from "@/ToolCallBlocks/ToolSnapshotFieldNotice.js";
 import { FallbackToolCallBlock } from "@/ToolCallBlocks/renderers/fallback.js";
@@ -116,7 +118,7 @@ function readResultRecord(value: unknown): ListModelsResult | null {
  * 命中，正是今天掉进 raw 兜底卡的根因）；legacy JSON 探针兜老会话与非 v4 宿主。一个都读不
  * 出来就回 null——「这台机器没有模型」与「读不懂这次结果」必须可分辨。
  */
-function readListModelsResult(
+export function readListModelsResult(
   toolCall: ToolCallBlockRenderContext["toolCallNode"]["toolCall"],
 ): ListModelsResult | null {
   const display = readToolResultDisplay(toolCall.raw);
@@ -179,7 +181,7 @@ function listModelsGroupName(
  * 上下文窗口的读法：千位以下原样，百万以下取整到 K，再往上到 M 且只在有小数时留一位
  * （`1M` / `1.5M`）。这一列是给人扫一眼比大小的，不是给人核对精确 token 数的。
  */
-function formatContextWindow(contextWindow: number): string {
+export function formatContextWindow(contextWindow: number): string {
   if (contextWindow < 1_000) {
     return String(contextWindow);
   }
@@ -253,7 +255,7 @@ function groupModelsByProvider(models: ListModelsEntryView[]): ListModelsGroup[]
 export function ListModelsToolCallBlock(context: ToolCallBlockRenderContext) {
   const { intl } = useZCodeIntl();
   const { toolCall } = context.toolCallNode;
-  const providerName = useWorkflowSubagentModelProviderName(context.workspacePath);
+  const providerName = useToolPresentationCapabilities().modelProviderName;
 
   const result = useMemo(() => readListModelsResult(toolCall), [toolCall]);
 

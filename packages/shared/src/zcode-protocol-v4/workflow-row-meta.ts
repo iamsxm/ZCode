@@ -64,6 +64,23 @@ export const workflowNotificationMetaSchema = z.discriminatedUnion("kind", [
     context: z.string().max(4000).optional(),
     askedAt: z.number().optional(),
   }),
+  // 留白（docs/dynamic-workflow/transcript-and-notifications.md「The payload」的 `hole` 种类）：run 走到一个
+  // 开着的 `hole<T>()`，那条分支停驻、主代理欠一段代码。`type` 是作者写的类型原文（`Plan`）；`before` /
+  // `after` 是留白两侧的阶段名；`draftPath` / `line` 指向草稿文件里留白所在的那一行。prompt 与升级问题
+  // 同一条 4000 上界，发射侧先截。与契约同名（apps/zcode-cli contracts 侧手工镜像）。
+  z.object({
+    kind: z.literal("hole"),
+    siteId: z.string().min(1).max(64),
+    ordinal: z.number().int().nonnegative(),
+    name: z.string().min(1).max(128),
+    type: z.string().min(1).max(128),
+    prompt: z.string().max(4000).optional(),
+    draftPath: z.string().max(1024).optional(),
+    line: z.number().int().positive().optional(),
+    before: z.string().max(128).optional(),
+    after: z.string().max(128).optional(),
+    reachedAt: z.number().optional(),
+  }),
   // run 级停滞：每个 stall 段一条，不是终态。
   z.object({
     kind: z.literal("stall"),
@@ -74,6 +91,21 @@ export const workflowNotificationMetaSchema = z.discriminatedUnion("kind", [
 ]);
 export type WorkflowNotificationMeta = z.infer<typeof workflowNotificationMetaSchema>;
 
+// 主代理闲着、run 还欠着决定时的提醒（docs/dynamic-workflow/transcript-and-notifications.md
+// 「Reminding an idle main agent」）：每个 run 一条，只带发出那一刻的计数与最久的等待——每个决定的
+// 原文在它自己那条 escalation / hole 行上，这一行不重复，也不随后续状态翻转。
+//
+// ⚠ 它是 originMeta 上**独立的键**，不是上面那个 union 的成员（同一篇文档「The payload」）。它曾经是
+// `kind: "blocked"`：闭集多一个成员，不认识它的客户端（手机远控页单独部署，可能比 CLI 旧）解析整帧
+// 失败，强制快照里是同一行、再次失败，于是整个会话打不开。不认识的**键**
+// 则只是被剥掉，行退回裸标题。所以新的通知种类一律加新的可选键，这个 union 不再加成员。
+export const workflowBlockedMetaSchema = z.object({
+  questions: z.number().int().nonnegative(),
+  holes: z.number().int().nonnegative(),
+  sinceMs: z.number().int().nonnegative(),
+});
+export type WorkflowBlockedMeta = z.infer<typeof workflowBlockedMetaSchema>;
+
 export const backgroundResultOriginMetaSchema = z.object({
   // 三个取值与 contracts 的 BackgroundResultOriginMeta 保持同步。
   // "workflow" 是 dynamic-workflow run（workId ≡ runId），复用整条后台通知管线。
@@ -83,6 +115,9 @@ export const backgroundResultOriginMetaSchema = z.object({
   // 只在 backgroundSource === "workflow" 的单条通知轮上在场；zod 剥离未知键，
   // 这里不加即整条链路静默丢——本字段是 manifest 渲染的唯一数据源。
   workflowNotification: workflowNotificationMetaSchema.optional(),
+  // 提醒载荷，与 workflowNotification 至多在场一个。`.catch(undefined)`：将来它的形状变了，认识这个
+  // 键的客户端把它当作缺席（裸标题行），而不是丢掉整帧。
+  workflowBlocked: workflowBlockedMetaSchema.optional().catch(undefined),
 });
 export type BackgroundResultOriginMeta = z.infer<typeof backgroundResultOriginMetaSchema>;
 
@@ -102,12 +137,14 @@ const workflowSubagentModelTextSchema = z
 // 设置轮：用户在 run 卡 / 详情页的「配置」里
 // 改了设置，agent 以同一份脚本修订出新 run，并用一条与直接启动同形的 controlOnly 轮记下这件事。
 // 这一块说**改了什么**：只有改动过的设置在场；每一项的 from / to 缺一端即那一端是默认
-// （模型 = 会话模型，上限 = 本机上限）。`ceiling` 是本机上限，供「13 → 4」这种读法。
+// （模型 = 会话模型，上限 = 默认并发）。`ceiling` 是默认并发 D（键名早于「默认并发」，为兼容旧端保留），
+// 供「默认 13 → 4」这种读法。
 export const workflowSettingsAmendMetaSchema = z.object({
-  // 修订自哪个 run。**缺席 = 就地生效**：只改并发上限、run
+  // 修订自哪个 run。**缺席 = 就地生效**（docs/dynamic-workflow/concurrency.md）：只改并发上限、run
   // 又在飞时，那次「配置」不停这次 run、也不另起一次，于是没有前驱可指——`runId` 指的就是被调整的
   // 那一个。渲染端据此只出那一行、不再出卡（同一条 run 画两张卡会读成两次运行）。
-  // 此字段为可选；生产者和消费者需使用一致的 schema 才能解析就地调整的设置记录。
+  // 记录在案的偏斜（与下方 scope / path 同一档）：旧桌面上它是必填，就地生效的设置轮在那里 parse
+  // 失败、整行被丢——丢的是一行记录，run 卡与运行本身不受影响。
   predecessorRunId: z.string().min(1).max(128).optional(),
   subagentModel: z
     .object({

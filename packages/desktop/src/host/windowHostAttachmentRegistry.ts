@@ -1,21 +1,21 @@
 import type { WindowHostAttachmentScope } from "@zcode/shared";
 import type { ZCodeAgentV4ClientMode } from "@zcode/services";
 
-interface WindowHostAttachmentPort {
+export interface WindowHostAttachmentPort {
   once(event: "close", listener: () => void): unknown;
 }
 
-interface WindowHostAttachmentHandle {
+export interface WindowHostAttachmentHandle {
   dispose(): void;
 }
 
-interface WindowHostResolvedAttachmentScope<TServices, TCapabilities = never> {
+export interface WindowHostResolvedAttachmentScope<TServices, TCapabilities = never> {
   services: TServices;
   generation: number;
   capabilities?: TCapabilities;
 }
 
-interface WindowHostExposeAttachmentParams<TServices, TPort, TCapabilities = never> {
+export interface WindowHostExposeAttachmentParams<TServices, TPort, TCapabilities = never> {
   requestId: string;
   attachmentId: string;
   clientMode: ZCodeAgentV4ClientMode;
@@ -61,6 +61,9 @@ export function createWindowHostAttachmentRegistry<
     scope: WindowHostAttachmentScope;
     port: TPort;
   }): void {
+    if (params.clientMode === "web-remote-replayable" && params.scope.kind === "source-settings") {
+      throw new Error("Source settings attachments are Desktop-only");
+    }
     // scope 必须先由 Host registry 验证；验证失败时不能影响同 attachmentId 的现有端口。
     const resolved = options.resolveScope(params.scope);
     const exposedParams: WindowHostExposeAttachmentParams<TServices, TPort, TCapabilities> = {
@@ -128,10 +131,24 @@ export function createWindowHostAttachmentRegistry<
     }
   }
 
+  function detachSourceSettingsAttachments(sourceServerId: string): void {
+    for (const [attachmentId, tracked] of attachments) {
+      if (
+        tracked.params.scope.kind !== "source-settings" ||
+        tracked.params.scope.sourceServerId !== sourceServerId
+      ) {
+        continue;
+      }
+      attachments.delete(attachmentId);
+      disposeTracked(tracked);
+    }
+  }
+
   return {
     attach,
     detach,
     detachRemoteSessionAttachments,
+    detachSourceSettingsAttachments,
     detachStaleRemoteSessionAttachments,
     size: () => attachments.size,
     list: () =>

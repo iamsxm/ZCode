@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import type {
   DockerContainerInfo,
   RemoteAssetInstallMode,
@@ -16,9 +16,17 @@ import {
 type RemoteKind = RemoteTarget["kind"];
 export type SSHAuthMethod = "password" | "privateKey";
 
-function buildAvailableKinds(options: { isWindowsDesktop: boolean }): RemoteKind[] {
+export function buildAvailableKinds(options: {
+  isWindowsDesktop: boolean;
+  isLocalDevelopmentRuntime: boolean;
+}): RemoteKind[] {
   const kinds: RemoteKind[] = ["ssh"];
-  // 远程连接入口里 WSL 和 SSH 同属主机类连接。
+  // Bugfix: Server remote 目前只是本地开发能力。之前无条件放入可选列表，
+  // 导致 production-mode 打包也会露出未对外开放的入口。
+  if (options.isLocalDevelopmentRuntime) {
+    kinds.push("server");
+  }
+  // Bugfix: 远程连接入口里 WSL 和 SSH 同属主机类连接。
   // Windows 下先放 WSL 再放 Docker，避免 WSL 被 Docker 隔开后在选择页显得离 SSH 很远。
   if (options.isWindowsDesktop) {
     kinds.push("wsl");
@@ -35,11 +43,18 @@ export function useRemoteConnectionForm({
   isWindowsDesktop,
   preferredKind,
   preferredWslDistro,
+  savedSshConfigAlias,
+  preserveDraftOnOpen = false,
+  discoverAll = false,
 }: {
   open: boolean;
   isWindowsDesktop: boolean;
   preferredKind?: RemoteKind;
   preferredWslDistro?: string;
+  /** 编辑已有连接时，保留历史别名，允许用户显式清除。 */
+  savedSshConfigAlias?: string;
+  preserveDraftOnOpen?: boolean;
+  discoverAll?: boolean;
 }) {
   const platform = usePlatform();
   const [kind, setKind] = useState<RemoteKind>("ssh");
@@ -57,6 +72,10 @@ export function useRemoteConnectionForm({
   const [wslUser, setWslUser] = useState("");
   const [dockerContainer, setDockerContainer] = useState("");
   const [manualDockerContainer, setManualDockerContainer] = useState("");
+  const [serverUrl, setServerUrl] = useState("");
+  const [serverName, setServerName] = useState("");
+  const [serverToken, setServerToken] = useState("");
+  const [serverWorkspacePath, setServerWorkspacePath] = useState("");
   const [sshConfigAliases, setSshConfigAliases] = useState<SSHConfigAliasOption[]>([]);
   const [sshConfigAliasesLoading, setSshConfigAliasesLoading] = useState(false);
   const [sshConfigAliasesLoaded, setSshConfigAliasesLoaded] = useState(false);
@@ -74,10 +93,18 @@ export function useRemoteConnectionForm({
   const applyingSshAliasRef = useRef(false);
   const dockerOptionsActiveLoadIdRef = useRef(0);
   const dockerOptionsInFlightLoadIdRef = useRef<number | null>(null);
+  const isLocalDevelopmentRuntime =
+    platform.isLocalDevelopmentRuntime === true || import.meta.env.DEV === true;
+
   const availableKinds = useMemo(
-    () => buildAvailableKinds({ isWindowsDesktop }),
-    [isWindowsDesktop],
+    () => buildAvailableKinds({ isWindowsDesktop, isLocalDevelopmentRuntime }),
+    [isLocalDevelopmentRuntime, isWindowsDesktop],
   );
+
+  const resetAssetInstallModeForNewFlow = useEffectEvent(() => {
+    // 打开不一定代表新建：收起恢复必须保留当前线路的下载选择。
+    if (!preserveDraftOnOpen) setAssetInstallMode(DEFAULT_REMOTE_ASSET_INSTALL_MODE);
+  });
 
   useEffect(() => {
     if (availableKinds.includes(kind)) {
@@ -95,11 +122,13 @@ export function useRemoteConnectionForm({
       return;
     }
 
-    setSshConfigAliases([]);
+    // 产品决策：资源下载方式只属于当前 SSH 线路，不再形成全局或“上次选择”偏好。
+    // 弹窗常驻挂载，只有新流程恢复默认值；收起后的同一线路继续使用当前选择。
+    resetAssetInstallModeForNewFlow();
     setSshConfigAliasesLoading(false);
     setSshConfigAliasesLoaded(false);
     setSshConfigAliasesError("");
-    setSelectedSshConfigAlias(null);
+    if (!preserveDraftOnOpen) setSelectedSshConfigAlias(null);
     setWslOptionsLoaded(false);
     setWslOptionsLoading(false);
     setWslOptionsError("");
@@ -109,10 +138,10 @@ export function useRemoteConnectionForm({
     setDockerOptionsLoading(false);
     setDockerOptionsError("");
     setDockerContainers([]);
-    if (preferredKind && availableKinds.includes(preferredKind)) {
+    if (!preserveDraftOnOpen && preferredKind && availableKinds.includes(preferredKind)) {
       setKind(preferredKind);
     }
-    if (preferredWslDistro !== undefined) {
+    if (!preserveDraftOnOpen && preferredWslDistro !== undefined) {
       setWslDistro(preferredWslDistro);
     }
   }, [availableKinds, open, preferredKind, preferredWslDistro]);
@@ -171,7 +200,7 @@ export function useRemoteConnectionForm({
   );
 
   useEffect(() => {
-    if (!open || kind !== "ssh" || sshConfigAliasesLoaded) {
+    if (!open || (!discoverAll && kind !== "ssh") || sshConfigAliasesLoaded) {
       return;
     }
 
@@ -206,10 +235,15 @@ export function useRemoteConnectionForm({
     return () => {
       cancelled = true;
     };
-  }, [kind, open, platform, sshConfigAliasesLoaded]);
+  }, [discoverAll, kind, open, platform, sshConfigAliasesLoaded]);
 
   useEffect(() => {
-    if (!selectedSshConfigAlias) {
+    if (
+      !sshConfigAliasesLoaded ||
+      Boolean(sshConfigAliasesError) ||
+      !selectedSshConfigAlias ||
+      selectedSshConfigAlias === savedSshConfigAlias
+    ) {
       return;
     }
 
@@ -218,10 +252,16 @@ export function useRemoteConnectionForm({
     }
 
     setSelectedSshConfigAlias(null);
-  }, [selectedSshConfigAlias, sshConfigAliases]);
+  }, [
+    selectedSshConfigAlias,
+    sshConfigAliases,
+    savedSshConfigAlias,
+    sshConfigAliasesLoaded,
+    sshConfigAliasesError,
+  ]);
 
   useEffect(() => {
-    if (!open || kind !== "wsl" || !isWindowsDesktop || wslOptionsLoaded) {
+    if (!open || (!discoverAll && kind !== "wsl") || !isWindowsDesktop || wslOptionsLoaded) {
       return;
     }
 
@@ -256,17 +296,35 @@ export function useRemoteConnectionForm({
     return () => {
       cancelled = true;
     };
-  }, [isWindowsDesktop, kind, open, platform, wslOptionsLoaded]);
+  }, [discoverAll, isWindowsDesktop, kind, open, platform, wslOptionsLoaded]);
 
   useEffect(() => {
-    if (!open || kind !== "docker" || dockerOptionsLoaded) {
+    if (!open || (!discoverAll && kind !== "docker") || dockerOptionsLoaded) {
       return;
     }
 
     refreshDockerContainers({ clearContainersOnError: true });
-  }, [dockerOptionsLoaded, kind, open, refreshDockerContainers]);
+  }, [discoverAll, dockerOptionsLoaded, kind, open, refreshDockerContainers]);
 
+  useEffect(() => {
+    return () => {
+      if (!discoverAll) {
+        // 刷新列表可能发生在首次发现完成后；失效边界必须跟随类型，不能跟随 loaded。
+        // 否则手动刷新的迟到响应仍会清除用户在下一次表单中选定的容器。
+        dockerOptionsActiveLoadIdRef.current += 1;
+        dockerOptionsInFlightLoadIdRef.current = null;
+        setDockerOptionsLoading(false);
+      }
+    };
+  }, [discoverAll, kind, open]);
+
+  const clearCredentials = () => {
+    setPassword("");
+    setPrivateKeyPassphrase("");
+  };
   const setHost = (value: string) => {
+    // 凭据属于当前目标；更换地址、用户或端口不能把旧目标的秘密带入新连接。
+    if (value.trim() !== host.trim()) clearCredentials();
     if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== host) {
       setSelectedSshConfigAlias(null);
     }
@@ -274,6 +332,7 @@ export function useRemoteConnectionForm({
   };
 
   const setPort = (value: string) => {
+    if (value !== port) clearCredentials();
     if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== port) {
       setSelectedSshConfigAlias(null);
     }
@@ -281,6 +340,7 @@ export function useRemoteConnectionForm({
   };
 
   const setUsername = (value: string) => {
+    if (value.trim() !== username.trim()) clearCredentials();
     if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== username) {
       setSelectedSshConfigAlias(null);
     }
@@ -288,6 +348,7 @@ export function useRemoteConnectionForm({
   };
 
   const setPrivateKeyPath = (value: string) => {
+    if (value !== privateKeyPath) setPrivateKeyPassphrase("");
     if (!applyingSshAliasRef.current && selectedSshConfigAlias && value !== privateKeyPath) {
       setSelectedSshConfigAlias(null);
     }
@@ -324,7 +385,31 @@ export function useRemoteConnectionForm({
     setSelectedSshConfigAlias(null);
   };
 
+  const resetDraft = () => {
+    setKind("ssh");
+    setHostState("");
+    setPortState("22");
+    setUsernameState("");
+    setSshAuthMethod("password");
+    setAssetInstallMode(DEFAULT_REMOTE_ASSET_INSTALL_MODE);
+    setPassword("");
+    setPrivateKeyPathState("");
+    setPrivateKeyPassphrase("");
+    setSelectedSshConfigAlias(null);
+    setWslDistro("");
+    setWslUser("");
+    setDockerContainer("");
+    setManualDockerContainer("");
+    setServerUrl("");
+    setServerName("");
+    setServerToken("");
+    setServerWorkspacePath("");
+  };
+
   return {
+    resetDraft,
+    discoveryLoading: sshConfigAliasesLoading || wslOptionsLoading || dockerOptionsLoading,
+    discoveryError: sshConfigAliasesError || wslOptionsError || dockerOptionsError,
     kind,
     host,
     port,
@@ -338,6 +423,10 @@ export function useRemoteConnectionForm({
     wslUser,
     dockerContainer,
     manualDockerContainer,
+    serverUrl,
+    serverName,
+    serverToken,
+    serverWorkspacePath,
     sshConfigAliases,
     sshConfigAliasesLoading,
     sshConfigAliasesError,
@@ -359,7 +448,11 @@ export function useRemoteConnectionForm({
     setWslUser,
     setDockerContainer,
     setManualDockerContainer,
-    // Docker 容器列表是运行态数据，之前只在进入 Docker 页时拉一次。
+    setServerUrl,
+    setServerName,
+    setServerToken,
+    setServerWorkspacePath,
+    // Bugfix: Docker 容器列表是运行态数据，之前只在进入 Docker 页时拉一次。
     // 下拉每次打开都通过这个回调按需刷新，避免用户看到已过期的容器列表。
     refreshDockerContainers: () => refreshDockerContainers({ clearContainersOnError: false }),
     applySshConfigAlias,

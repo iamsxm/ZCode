@@ -37,7 +37,10 @@ export interface StartupWorkspaceWarmupTarget {
   workspaceIdentity?: string;
 }
 
-const STARTUP_AGENT_WARMUP_LIMIT = 3;
+// 修复原因：会话 CLI 没有 idle 回收，启动预热 3 个会让每个窗口常驻 3 份 Agent 进程内存；
+// 切到最近项目的冷启动收益抵不上常驻成本，收敛为只预热 active workspace。
+// 与 @zcode/protocol 的 init-local `agentWarmupTargets.max(1)` 保持一致。
+export const STARTUP_AGENT_WARMUP_LIMIT = 1;
 
 export interface StartupWindowBootstrap {
   restoreSession?: boolean;
@@ -71,34 +74,6 @@ function resolvePersistedActiveSession(
   return sessions[activeIndex];
 }
 
-function resolveStartupAgentWarmupTargets(
-  settings: Pick<ReturnType<typeof appSettingsSchema.parse>, "recentProjects">,
-  activeTarget: StartupWorkspaceWarmupTarget,
-): StartupWorkspaceWarmupTarget[] {
-  const candidates: StartupWorkspaceWarmupTarget[] = [
-    activeTarget,
-    ...(settings.recentProjects ?? []).map((workspacePath) => ({
-      workspacePath,
-    })),
-  ];
-  const seen = new Set<string>();
-  const targets: StartupWorkspaceWarmupTarget[] = [];
-
-  for (const candidate of candidates) {
-    const workspaceKey = candidate.workspaceIdentity?.trim() || candidate.workspacePath;
-    if (!workspaceKey || seen.has(workspaceKey)) {
-      continue;
-    }
-    seen.add(workspaceKey);
-    targets.push(candidate);
-    if (targets.length === STARTUP_AGENT_WARMUP_LIMIT) {
-      break;
-    }
-  }
-
-  return targets;
-}
-
 export function createOpenWorkspaceStartupBootstrap(workspacePath: string): StartupWindowBootstrap {
   return {
     initialWorkspacePath: workspacePath,
@@ -117,13 +92,16 @@ export async function resolveStartupWindowBootstrap({
   logger?: StartupWorkspaceLogger;
 }): Promise<StartupWindowBootstrap> {
   const settings = await readStartupSettings(settingsFile, logger);
-  const sessions = settings.lastWorkspaceSession ?? [];
+  const sessions =
+    settings.lastActiveWorkspace === undefined
+      ? (settings.lastWorkspaceSession ?? [])
+      : settings.lastActiveWorkspace
+        ? [settings.lastActiveWorkspace]
+        : [];
+  const activeIndex = settings.lastActiveWorkspace === undefined ? settings.lastActiveTabIndex : 0;
 
   if (sessions.length > 0) {
-    const persistedActiveSession = resolvePersistedActiveSession(
-      sessions,
-      settings.lastActiveTabIndex,
-    );
+    const persistedActiveSession = resolvePersistedActiveSession(sessions, activeIndex);
     const unavailableWorkspacePath =
       persistedActiveSession?.kind === "local" &&
       !(await isAvailableWorkspaceDirectory(persistedActiveSession.workspacePath))
@@ -138,24 +116,20 @@ export async function resolveStartupWindowBootstrap({
         unavailableWorkspacePath,
       );
     }
-    const localActiveSessionIndex = resolveStartupLocalWorkspaceSessionIndex(
-      sessions,
-      settings.lastActiveTabIndex,
-    );
+    const localActiveSessionIndex = resolveStartupLocalWorkspaceSessionIndex(sessions, activeIndex);
     const activeSession =
       localActiveSessionIndex == null ? undefined : sessions[localActiveSessionIndex];
     if (activeSession?.kind === "local") {
-      // 被动 sessions-index 全量恢复不能再启动全部 workspace，但只预热当前一个又让
-      // 用户在最近项目间切换重新承担完整冷启动。Main 在唯一启动边界固定选出最近 3 个，
-      // Host 仍走原 initializeWorkspace 路径；失败不继续扫描第 4 个补位。
-      const agentWarmupTargets = resolveStartupAgentWarmupTargets(settings, {
-        workspacePath: activeSession.workspacePath,
-      });
+      // 项目/最近目录不再决定 Agent 生命周期，只预热上次活动执行目录。
+      const agentWarmupTargets = [{ workspacePath: activeSession.workspacePath }];
       return {
         ...(unavailableWorkspacePath ? { unavailableWorkspacePath } : {}),
         agentWarmupTargets,
       };
     }
+    // 远程活动项没有本地预热目标，Host 会用此 app-owned cwd 准备会话库。
+    // 切换数据根后该目录尚不存在；必须在交给 Host 前创建，否则 CLI 在发出存储帧前即退出。
+    await mkdir(conversationWorkspaceDir, { recursive: true });
     return unavailableWorkspacePath ? { unavailableWorkspacePath } : {};
   }
 

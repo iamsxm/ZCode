@@ -13,14 +13,16 @@ export interface ServerLayout {
   readonly componentsCacheDir: string;
   readonly stableBinDir: string;
   readonly statusFile: string;
+  readonly ingressTokenFile: string;
   readonly lockFile: string;
   readonly controlEndpoint: string;
   readonly serviceDir: string;
   readonly uninstalledFile: string;
   readonly updateTransactionFile: string;
+  readonly updateLockFile: string;
 }
 
-function getDefaultServerDataRoot(): string {
+export function getDefaultServerDataRoot(): string {
   const configured = process.env.ZCODE_DATA_BASE_DIR?.trim();
   return join(configured || homedir(), ".zcode", "server");
 }
@@ -39,6 +41,7 @@ export function resolveServerLayout(serverRoot = getDefaultServerDataRoot()): Se
     componentsCacheDir: join(root, "cache", "components"),
     stableBinDir: join(root, "bin"),
     statusFile: join(runDir, "status.json"),
+    ingressTokenFile: join(runDir, "ingress-token"),
     lockFile: join(runDir, "server.lock"),
     controlEndpoint:
       process.platform === "win32"
@@ -47,6 +50,7 @@ export function resolveServerLayout(serverRoot = getDefaultServerDataRoot()): Se
     serviceDir: join(root, "service"),
     uninstalledFile: join(root, "uninstalled.json"),
     updateTransactionFile: join(root, "update-transaction.json"),
+    updateLockFile: join(runDir, "update.lock"),
   };
 }
 
@@ -104,7 +108,7 @@ export function isPathWithin(rootPath: string, candidatePath: string): boolean {
   return diff === "" || (!diff.startsWith("..") && !diff.split(sep).includes(".."));
 }
 
-interface UninstallTargetValidation {
+export interface UninstallTargetValidation {
   ok: boolean;
   reason?: "outside-server-root" | "home-directory" | "non-absolute";
   canonicalPath?: string;
@@ -128,10 +132,18 @@ export function validateUninstallTarget(
   return { ok: true, canonicalPath };
 }
 
-function assertServerDataRoot(serverRoot: string): string {
+export async function canonicalExistingPath(pathValue: string): Promise<string> {
+  return await realpath(pathValue);
+}
+
+export function assertServerDataRoot(serverRoot: string): string {
   const resolved = resolve(serverRoot);
   if (!isAbsolute(resolved) || resolved === dirname(resolved)) {
     throw new Error("Invalid server data root");
   }
   return resolved;
+}
+
+export function serverDataRootFromBase(baseDir: string): string {
+  return join(resolve(baseDir), ".zcode", "server");
 }

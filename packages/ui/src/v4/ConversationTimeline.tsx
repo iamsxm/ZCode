@@ -1,3 +1,5 @@
+import { useBotTopicPreparations } from "@/v4/BotTopicPreparation.js";
+import { withTopicPreparationMessages } from "@/v4/topicPreparationRenderUnits.js";
 /* oxlint-disable eslint(max-lines) -- ConversationTimeline 集中承载虚拟滚动、滚动锚定、loadOlder 与 find 高亮协调；拆散会让同一滚动状态跨文件传递。 */
 import {
   Component,
@@ -8,15 +10,17 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
   type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type TouchEvent as ReactTouchEvent,
   type WheelEvent as ReactWheelEvent,
 } from "react";
+import { flushSync } from "react-dom";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { ArrowDownIcon } from "lucide-react";
-import { TID_V4_TIMELINE, TID_V4_TIMELINE_BOTTOM } from "@zcode/shared";
+import { TID_V4_TIMELINE, TID_V4_TIMELINE_BOTTOM } from "@zcode/shared/test-ids";
 import type {
   ApiRetryState,
   AttachmentRef,
@@ -32,18 +36,33 @@ import { Button } from "@/components/ui/button.js";
 import { useZCodeIntl } from "@/i18n/IntlProvider.js";
 import { logger } from "@/logger.js";
 import { ConversationTurnGroup } from "@/v4/ConversationTurnGroup.js";
+import {
+  deriveLogicalUiInstances,
+  getPluginUiDisclosureVersion,
+  getPluginUiManualPin,
+  setPluginUiInstanceDerivation,
+  subscribePluginUiDisclosure,
+  type PluginUiRowPinResolver,
+} from "@/plugin-ui/index.js";
 import { ConversationPendingGuideList } from "@/v4/ConversationPendingGuideList.js";
 import type { AssistantFeedbackHandler } from "@/v4/ConversationRowView.js";
 import { ConversationTurnNavigator } from "@/v4/ConversationTurnNavigator.js";
 import { syncConversationShareSelectionPanelLayout } from "@/v4/conversationShareSelectionPanelLayout.js";
 import type { ConversationRowRenderContext } from "@/v4/conversationRowContext.js";
-import { splitConversationTimelineLiveTail } from "@/v4/conversationTimelineLiveTail.js";
+import {
+  isSameConversationLatestTurnSummary,
+  resolveConversationLatestTurnSummary,
+  splitConversationTimelineLiveTail,
+  type ConversationLatestTurnSummary,
+} from "@/v4/conversationTimelineLiveTail.js";
+import { armHighspeedFooterExpiryClock } from "@/highspeed/highspeedFooterExpiryClock.js";
 import {
   getConversationContentWidthClassName,
   getConversationStatusPanelOffsetClassName,
 } from "@/v4/conversationLayout.js";
 import {
   buildConversationTurnRenderUnits,
+  resolveNextHighspeedExpiryMs,
   type ConversationTurnRenderUnit,
 } from "@/v4/conversationTurnRenderUnits.js";
 import {
@@ -246,8 +265,10 @@ function getUnitHeightCacheKey(unit: ConversationTurnRenderUnit | undefined): st
   return unit?.key;
 }
 
-interface ConversationTimelineProps {
+export interface ConversationTimelineProps {
   rows: readonly ConversationRow[];
+  /** 手机远控窄屏允许整条会话 flex 链按抽屉宽度收缩；桌面布局保持原样。 */
+  compactForRemoteControl?: boolean;
   /** CLI 权威 queue 中等待 model-step 注入的 guide；只改变 renderer 落位。 */
   pendingGuides?: readonly QueueItem[];
   /** runtime memory 状态，只交给当前 live turn，不进入历史虚拟列表。 */
@@ -310,6 +331,18 @@ interface ConversationTimelineProps {
   centerEmptyStateWithDock?: boolean;
   /** 窄屏/粗指针视口保留紧凑居中布局，不复用桌面草稿安全间距。 */
   compactEmptyStateWithDock?: boolean;
+  /**
+   * Side Pane 完整视图浮窗形态：底部输入区不留内边距，输入框外壳即浮窗最外层；
+   * 输入区脱离滚动流贴在时间线底部，滚动容器（含滚动条）止于输入框上方。
+   */
+  floatingComposerDock?: boolean;
+  /** 浮窗形态下上报底部输入区实测高度，宿主据此裁剪收起态。 */
+  onComposerDockHeightChange?: (heightPx: number) => void;
+  /**
+   * 浮窗形态下上报最后一个回合的运行状态、运行时长与最终回答（同一个 render unit），
+   * 供输入框占位「工作中 N 秒」与回答气泡使用；值变化时才回调。
+   */
+  onLatestTurnSummaryChange?: (summary: ConversationLatestTurnSummary) => void;
   /** 右侧状态面板对消息列的布局模式；auto 由 conversation container query 裁决。 */
   summaryPanelLayout?: "none" | "auto" | "inline";
   conversationFindQuery?: string;
@@ -331,13 +364,7 @@ interface ConversationTimelineProps {
     onAddToCurrentTask: (reference: ConversationSelectionReference) => void;
     onAskInSideChat: (reference: ConversationSelectionReference) => void;
   };
-  /** 分享选择阶段的本轮勾选状态；仅桌面分享时间线传入。 */
-  shareSelection?: {
-    eligibleRowIds: ReadonlySet<number>;
-    selectedRowIds: ReadonlySet<number>;
-    onToggle: (rowId: number) => void;
-  };
-  /** 分享选择流程存在时，左侧 rail 由分享面板或 reopen 按钮独占。 */
+  /** 范围编辑时，左侧 rail 由分享选择面板独占。 */
   hideTurnNavigator?: boolean;
 }
 
@@ -351,6 +378,7 @@ interface ConversationTimelineProps {
  */
 function ConversationTimelineImpl({
   rows,
+  compactForRemoteControl = false,
   pendingGuides = EMPTY_PENDING_GUIDES,
   apiRetry = null,
   totalCount,
@@ -373,6 +401,9 @@ function ConversationTimelineImpl({
   headerSlot,
   centerEmptyStateWithDock = false,
   compactEmptyStateWithDock = false,
+  floatingComposerDock = false,
+  onComposerDockHeightChange,
+  onLatestTurnSummaryChange,
   summaryPanelLayout = "none",
   conversationFindQuery = "",
   conversationFindActiveIndex = -1,
@@ -384,7 +415,6 @@ function ConversationTimelineImpl({
   scrollToBottomActionRef,
   scrollToQueryActionRef,
   selectionActions,
-  shareSelection,
   hideTurnNavigator = false,
 }: ConversationTimelineProps) {
   const { intl } = useZCodeIntl();
@@ -414,19 +444,74 @@ function ConversationTimelineImpl({
     return () => observer.disconnect();
   }, [hasHeaderSlot]);
   const [liveNowMs, setLiveNowMs] = useState(() => Date.now());
+  // 插件卡片展示模型——同资源替代 + 最近三回合自动展开 + 手动固定；推导结果发布给卡片自己读。
+  const pluginUiDerivation = useMemo(() => deriveLogicalUiInstances(rows), [rows]);
+  useEffect(() => {
+    setPluginUiInstanceDerivation(sessionKey, pluginUiDerivation);
+  }, [pluginUiDerivation, sessionKey]);
+  const pluginUiDisclosureVersion = useSyncExternalStore(
+    subscribePluginUiDisclosure,
+    getPluginUiDisclosureVersion,
+    getPluginUiDisclosureVersion,
+  );
+  const pluginUiPinResolver = useMemo<PluginUiRowPinResolver>(() => {
+    // 手动固定 / 收起变化（version 递增）时重建 resolver，折叠边界随之重算。
+    void pluginUiDisclosureVersion;
+    return (toolCallId) => ({
+      disposition: pluginUiDerivation.byToolCallId[toolCallId],
+      manualPinned: getPluginUiManualPin(sessionKey, toolCallId),
+    });
+  }, [pluginUiDerivation, sessionKey, pluginUiDisclosureVersion]);
+  const topicPreparations = useBotTopicPreparations();
   const renderUnits = useMemo(
     () =>
-      buildConversationTurnRenderUnits(rows, {
-        nowMs: liveNowMs,
-        sessionPhase,
-      }),
-    [liveNowMs, rows, sessionPhase],
+      withTopicPreparationMessages(
+        buildConversationTurnRenderUnits(rows, {
+          nowMs: liveNowMs,
+          sessionPhase,
+          pluginUiPinResolver,
+        }),
+        rows,
+        topicPreparations,
+      ),
+    [liveNowMs, pluginUiPinResolver, rows, sessionPhase, topicPreparations],
   );
   const { virtualizedUnits, liveUnit, liveUnitIndex } = useMemo(
     () => splitConversationTimelineLiveTail(renderUnits),
     [renderUnits],
   );
   const hasRunningUnit = useMemo(() => renderUnits.some((unit) => unit.isRunning), [renderUnits]);
+  const latestTurnSummary = useMemo(
+    () => resolveConversationLatestTurnSummary(renderUnits),
+    [renderUnits],
+  );
+  // 回调随会话 owner 变化；换了回调必须重新上报，不能因值相同而跳过。
+  const reportedLatestTurnSummaryRef = useRef<{
+    callback: (summary: ConversationLatestTurnSummary) => void;
+    summary: ConversationLatestTurnSummary;
+  } | null>(null);
+  useEffect(() => {
+    if (!onLatestTurnSummaryChange) {
+      reportedLatestTurnSummaryRef.current = null;
+      return;
+    }
+    const reported = reportedLatestTurnSummaryRef.current;
+    if (
+      reported?.callback === onLatestTurnSummaryChange &&
+      isSameConversationLatestTurnSummary(reported.summary, latestTurnSummary)
+    ) {
+      return;
+    }
+    reportedLatestTurnSummaryRef.current = {
+      callback: onLatestTurnSummaryChange,
+      summary: latestTurnSummary,
+    };
+    onLatestTurnSummaryChange(latestTurnSummary);
+  }, [latestTurnSummary, onLatestTurnSummaryChange]);
+  const nextHighspeedExpiryMs = useMemo(
+    () => resolveNextHighspeedExpiryMs(rows, liveNowMs),
+    [liveNowMs, rows],
+  );
   const turnNavigatorQueryRowIds = useMemo(
     () =>
       new Set(
@@ -453,10 +538,13 @@ function ConversationTimelineImpl({
   const stableContentWidthRef = useRef<number | null>(null);
   const contentWidthResizeActiveRef = useRef(false);
   const contentWidthResizeSettleTimerRef = useRef<number | null>(null);
+  const committingMeasuredLayoutRef = useRef(false);
+  const messageLayerMaskObserverRef = useRef<ResizeObserver | null>(null);
   const isContentWidthChanging = useCallback(() => {
     const currentContentWidth = virtualHistoryRef.current?.clientWidth ?? null;
     const stableContentWidth = stableContentWidthRef.current;
     return (
+      committingMeasuredLayoutRef.current ||
       contentWidthResizeActiveRef.current ||
       (currentContentWidth !== null &&
         stableContentWidth !== null &&
@@ -513,6 +601,8 @@ function ConversationTimelineImpl({
   const [turnNavigatorHydrationRetryRevision, setTurnNavigatorHydrationRetryRevision] = useState(0);
   const timelineRootRef = useRef<HTMLDivElement>(null);
   const composerDockRef = useRef<HTMLDivElement>(null);
+  const floatingComposerDockRef = useRef(floatingComposerDock);
+  floatingComposerDockRef.current = floatingComposerDock;
   const shareSelectionPanelLayoutRef = useRef<{
     centerYPx: number;
     maxHeightPx: number;
@@ -567,6 +657,20 @@ function ConversationTimelineImpl({
     };
   }, [backgroundScrollLocked, selectionPanelLayoutContainerRef, syncShareSelectionPanelLayout]);
 
+  const hasBottomDock = Boolean(bottomDock);
+  useLayoutEffect(() => {
+    // 完整视图浮窗收起态只露出底部输入区：由 dock 自身测量并上报高度（权限/问答卡片
+    // 替换输入框时高度随之变化），宿主不去猜 SessionPane 内部结构。
+    const dock = composerDockRef.current;
+    if (!onComposerDockHeightChange || !dock || !hasBottomDock) return;
+    const report = () => onComposerDockHeightChange(dock.getBoundingClientRect().height);
+    report();
+    if (typeof ResizeObserver === "undefined") return;
+    const resizeObserver = new ResizeObserver(report);
+    resizeObserver.observe(dock);
+    return () => resizeObserver.disconnect();
+  }, [hasBottomDock, onComposerDockHeightChange]);
+
   useEffect(() => {
     if (!hasRunningUnit) {
       return;
@@ -581,6 +685,18 @@ function ConversationTimelineImpl({
 
     return () => window.clearInterval(timer);
   }, [hasRunningUnit]);
+
+  useEffect(() => {
+    if (nextHighspeedExpiryMs === undefined) return;
+
+    // Bug 根因：会话完成后工作时钟会停止；若 Highspeed 卡稍后才到期，footer 不会自行出现。
+    // 单独订阅最近的卡片到期边界，避免为了等待倒计时持续刷新整个历史列表。
+    // spec §9.3：到期唤醒基于 renderer setTimeout，窗口隐藏/被遮挡时会被 Chromium 冻结停摆；
+    // helper 额外监听窗口恢复可见/获得焦点并即时追平 liveNowMs，footer 才能不依赖用户再发
+    // 消息就出现。与 SessionPane 的 highspeedAutoShareClock 窗口唤醒补偿分工：那条刷新分享
+    // 入口/查看按钮的完成态数据，这条刷新组尾 footer 的显隐时钟。
+    return armHighspeedFooterExpiryClock(nextHighspeedExpiryMs, () => setLiveNowMs(Date.now()));
+  }, [nextHighspeedExpiryMs]);
 
   useLayoutEffect(() => {
     const element = timelineRootRef.current;
@@ -719,6 +835,7 @@ function ConversationTimelineImpl({
     return height;
   }, []);
 
+  const [, commitMeasuredLayout] = useState(0);
   const virtualizer = useVirtualizer({
     count: virtualizedUnits.length,
     getScrollElement,
@@ -879,6 +996,8 @@ function ConversationTimelineImpl({
     if (!messageLayer) return;
 
     if (
+      // 浮窗形态下输入区不在滚动视口内，消息不会经过输入框，底部遮罩只会吃掉消息。
+      floatingComposerDockRef.current ||
       isAtBottom({
         scrollTop: element.scrollTop,
         viewportHeight: element.clientHeight,
@@ -910,6 +1029,27 @@ function ConversationTimelineImpl({
     messageLayer.style.maskSize = `100% ${viewportHeight}px`;
     messageLayer.style.webkitMaskSize = `100% ${viewportHeight}px`;
   }, []);
+
+  useLayoutEffect(() => {
+    // 修复原因：浮窗展开态输入区曾是滚动容器内的 sticky 层，滚动条一直延伸到输入框后面。
+    // 浮窗形态下输入区改为相对时间线根节点贴底（同一 DOM，不重挂载），滚动容器底边让出输入区高度。
+    const root = timelineRootRef.current;
+    const dock = composerDockRef.current;
+    if (!floatingComposerDock || !root || !dock) return;
+    const sync = () =>
+      root.style.setProperty(
+        "--v4-floating-composer-dock-height",
+        `${dock.getBoundingClientRect().height}px`,
+      );
+    sync();
+    if (scrollRef.current) syncMessageLayerMask(scrollRef.current);
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(sync);
+    resizeObserver?.observe(dock);
+    return () => {
+      resizeObserver?.disconnect();
+      root.style.removeProperty("--v4-floating-composer-dock-height");
+    };
+  }, [floatingComposerDock, hasBottomDock, syncMessageLayerMask]);
 
   const syncTurnNavigatorViewport = useCallback(
     (element: HTMLDivElement) => {
@@ -956,9 +1096,14 @@ function ConversationTimelineImpl({
     sync();
     if (typeof ResizeObserver !== "undefined") {
       const observer = new ResizeObserver(sync);
+      messageLayerMaskObserverRef.current = observer;
       observer.observe(scrollElement);
       observer.observe(messageLayer);
-      return () => observer.disconnect();
+      return () => {
+        observer.disconnect();
+        if (messageLayerMaskObserverRef.current === observer)
+          messageLayerMaskObserverRef.current = null;
+      };
     }
 
     window.addEventListener("resize", sync);
@@ -1060,8 +1205,83 @@ function ConversationTimelineImpl({
     if (!contentColumn || typeof ResizeObserver === "undefined") return;
 
     stableContentWidthRef.current = contentColumn.clientWidth;
+    let observedViewportHeight = scrollRef.current?.clientHeight ?? 0;
+    let observeContentFrame: number | null = null;
+    let disposed = false;
     const observer = new ResizeObserver(() => {
       const nextWidth = contentColumn.clientWidth;
+      const element = scrollRef.current;
+      if (!element) return;
+      const viewportHeightChanged = observedViewportHeight !== element.clientHeight;
+      observedViewportHeight = element.clientHeight;
+      if (nextWidth === stableContentWidthRef.current && !viewportHeightChanged) return;
+      markLayoutScrollGuard();
+      commitFollowing(
+        reconcileFollowingForContentAnchor({
+          following: followingRef.current,
+          metrics: {
+            scrollTop: element.scrollTop,
+            viewportHeight: element.clientHeight,
+            contentHeight: element.scrollHeight,
+          },
+          lastObservedScrollTop: lastObservedScrollTopRef.current,
+          userScrollIntent: getActiveUserScrollIntent(),
+        }),
+      );
+      if (followingRef.current) {
+        if (contentWidthResizeSettleTimerRef.current !== null) {
+          window.clearTimeout(contentWidthResizeSettleTimerRef.current);
+          contentWidthResizeSettleTimerRef.current = null;
+        }
+        // 本批次统一提交布局与吸底，其间其他内容 effect 不得按中间高度吸底。
+        observer.unobserve(contentColumn);
+        const messageLayer = messageLayerRef.current;
+        const maskObserver = messageLayerMaskObserverRef.current;
+        // 同步占位高度也会改变父消息层的高度；其蒙层观察器需要一起暂停，
+        // 否则在更深层的 RO 通知中改变父层，会产生 undelivered notifications。
+        if (messageLayer) maskObserver?.unobserve(messageLayer);
+        committingMeasuredLayoutRef.current = true;
+        try {
+          // virtualizer 的 ResizeObserver 默认异步提交 React；先吸底会使用旧占位高度，
+          // 下一帧测高提交后再跳一次。仅在 observer 内批量测高并同步提交，避免跨帧追赶。
+          const measurements = Array.from(
+            contentColumn.querySelectorAll(":scope > [data-index]"),
+            (node) => ({
+              index: Number(node.getAttribute("data-index")),
+              height: measureElement(node, undefined),
+            }),
+          );
+          flushSync(() => {
+            for (const item of measurements) virtualizer.resizeItem(item.index, item.height);
+            // 缓存可能已经更新且没有差量，仍需明确提交，不能依赖空回调冲刷旧任务。
+            commitMeasuredLayout((revision) => revision + 1);
+          });
+        } finally {
+          committingMeasuredLayoutRef.current = false;
+          // 暂停的是本批次会写入高度的观察目标，不推迟测高或吸底。下一帧继续
+          // 观察内容列宽度，以覆盖视口停止后仍在进行的 CSS 宽度过渡。
+          if (observeContentFrame !== null) window.cancelAnimationFrame(observeContentFrame);
+          if (!disposed) {
+            observeContentFrame = window.requestAnimationFrame(() => {
+              observeContentFrame = null;
+              observer.observe(contentColumn);
+              if (
+                messageLayer &&
+                messageLayerRef.current === messageLayer &&
+                messageLayerMaskObserverRef.current === maskObserver
+              )
+                maskObserver?.observe(messageLayer);
+            });
+          }
+        }
+        if (disposed) return;
+        stableContentWidthRef.current = contentColumn.clientWidth;
+        contentWidthResizeActiveRef.current = false;
+        // 同步提交可能触发其他布局处理；用户上滚或定位始终优先。
+        if (followingRef.current && getActiveUserScrollIntent() !== "awayFromBottom")
+          scrollToBottom();
+        return;
+      }
       if (nextWidth === stableContentWidthRef.current) return;
 
       // 宽度变化会让虚拟行分批重新测高；逐行补偿或逐批追底都会
@@ -1080,16 +1300,27 @@ function ConversationTimelineImpl({
       }, CONTENT_WIDTH_RESIZE_SETTLE_MS);
     });
     observer.observe(contentColumn);
+    if (scrollRef.current) observer.observe(scrollRef.current);
 
     return () => {
+      disposed = true;
       observer.disconnect();
+      if (observeContentFrame !== null) window.cancelAnimationFrame(observeContentFrame);
       if (contentWidthResizeSettleTimerRef.current !== null) {
         window.clearTimeout(contentWidthResizeSettleTimerRef.current);
         contentWidthResizeSettleTimerRef.current = null;
       }
       contentWidthResizeActiveRef.current = false;
     };
-  }, [renderUnits.length === 0, scrollToBottom]);
+  }, [
+    commitFollowing,
+    getActiveUserScrollIntent,
+    markLayoutScrollGuard,
+    measureElement,
+    renderUnits.length === 0,
+    scrollToBottom,
+    virtualizer,
+  ]);
 
   useLayoutEffect(() => {
     const element = liveTailRef.current;
@@ -1687,7 +1918,10 @@ function ConversationTimelineImpl({
   // raw projection row 与按 turn 合并后的 render unit 不是同一计量单位；
   // 分开暴露才能让恢复/分页验证不再把可见 unit 误当成持久 row。
   return (
-    <div ref={timelineRootRef} className="relative flex min-h-0 flex-1 flex-col">
+    <div
+      ref={timelineRootRef}
+      className={cn("relative flex min-h-0 flex-1 flex-col", compactForRemoteControl && "min-w-0")}
+    >
       {selectionActions ? (
         <ConversationSelectionTooltip
           rootRef={scrollRef}
@@ -1704,7 +1938,7 @@ function ConversationTimelineImpl({
         capture={captureScrollMemoryBeforeScopeMutation}
         commit={commitCapturedScrollMemory}
       />
-      {/* 分享选择流程无论面板展开还是收起，左 rail 都由分享面板或 reopen 按钮独占，
+      {/* Bugfix：分享选择流程无论面板展开还是收起，左 rail 都由分享面板或 reopen 按钮独占，
           必须隐藏对话轮导航，避免两个绝对定位控件互相覆盖。退出分享选择后自动恢复。 */}
       {hideTurnNavigator ? null : (
         <ConversationTurnNavigator
@@ -1750,7 +1984,11 @@ function ConversationTimelineImpl({
           // 分享选择面板展开时改为 overflow-hidden：scrollTop 与 scrollbar-gutter 都保持不变，
           // 但原生滚动条、滚轮和键盘翻页都不再能移动背景，勾选目标不会漂走。
           backgroundScrollLocked && "!overflow-y-hidden",
-          // Conversation turn map 覆盖 timeline 左侧 48px；表格增强滚动如果仍按
+          compactForRemoteControl && "min-w-0",
+          // 浮窗形态：滚动容器止于输入框上方 12px，消息底部再留 16px 空白。
+          floatingComposerDock &&
+            "mb-[calc(var(--v4-floating-composer-dock-height,0px)+12px)] pb-4",
+          // 修复原因：Conversation turn map 覆盖 timeline 左侧 48px；表格增强滚动如果仍按
           // 普通 16px 边距借位，会有 32px 落到 turn map 下方，必须把完整占用计入左边界。
           turnNavigatorQueryRowIds.size >= 2 &&
             "@min-[864px]/conversation:[--markdown-table-layout-left-inset:48px]",
@@ -1762,7 +2000,7 @@ function ConversationTimelineImpl({
             // 顶部留白按视口高度伸缩，输入框的位置不再受下方推荐列表高度影响；
             // 空间不足时顶部可收缩到底线，底部继续随内容自然排布。
             responsiveCenteredEmptyLayout
-              ? // 动态修改原生窗口下限会把内容换行反馈到窗口拖动，产生阻尼；
+              ? // Bugfix 根因：动态修改原生窗口下限会把内容换行反馈到窗口拖动，产生阻尼；
                 // 容器保留固有最小高度，由外层 timeline 统一承接受限高度下的溢出内容。
                 "flex min-h-full flex-col items-center px-4 before:block before:min-h-[52px] before:w-full before:shrink before:basis-[29dvh] before:content-[''] after:block after:min-h-4 after:w-full after:flex-1 after:content-['']"
               : centeredEmptyLayout
@@ -1789,6 +2027,7 @@ function ConversationTimelineImpl({
             <div
               ref={messageLayerRef}
               data-v4-timeline-message-layer="true"
+              data-sandbox-page-container="true"
               className="relative w-full flex-1 [mask-repeat:no-repeat] [-webkit-mask-repeat:no-repeat]"
             >
               {/*
@@ -1840,13 +2079,13 @@ function ConversationTimelineImpl({
                     >
                       <ConversationTurnGroup
                         unit={unit}
+                        nowMs={liveNowMs}
                         apiRetry={null}
                         context={rowContext}
                         onFork={onFork}
                         onRetry={onRetry}
                         onFeedbackChange={onFeedbackChange}
                         onEdit={onEdit}
-                        shareSelection={shareSelection}
                       />
                     </div>
                   );
@@ -1870,13 +2109,13 @@ function ConversationTimelineImpl({
                 >
                   <ConversationTurnGroup
                     unit={liveUnit}
+                    nowMs={liveNowMs}
                     apiRetry={apiRetry}
                     context={rowContext}
                     onFork={onFork}
                     onRetry={onRetry}
                     onFeedbackChange={onFeedbackChange}
                     onEdit={onEdit}
-                    shareSelection={shareSelection}
                   />
                 </div>
               ) : null}
@@ -1911,11 +2150,15 @@ function ConversationTimelineImpl({
                 // sticky dock 是 z-20 的全宽透明层，过去会盖住 z-10 rail
                 // 在 composer 左侧留白内的按钮。外壳不接事件，只让实际内容列恢复命中。
                 "pointer-events-none z-20 flex w-full justify-center",
-                responsiveCenteredEmptyLayout
-                  ? "mt-3 shrink-0"
-                  : centeredEmptyLayout
-                    ? "shrink-0"
-                    : "sticky bottom-0",
+                // 浮窗形态：滚动容器与内容层都没有定位，absolute 的包含块是时间线根节点，
+                // 输入区贴在时间线底部、不随消息滚动，也不被滚动容器裁剪。
+                floatingComposerDock
+                  ? "absolute inset-x-0 bottom-0"
+                  : responsiveCenteredEmptyLayout
+                    ? "mt-3 shrink-0"
+                    : centeredEmptyLayout
+                      ? "shrink-0"
+                      : "sticky bottom-0",
               )}
             >
               <div
@@ -1925,7 +2168,8 @@ function ConversationTimelineImpl({
                   // ≥1280px 面板让位时降级为只过渡 transform，避免大范围跳变叠加位移抖动。
                   "pointer-events-auto relative z-10 w-full shrink-0 transition-[width,max-width,transform] duration-150 ease-out @min-[1280px]/conversation:transition-[transform]",
                   contentWidthClassName,
-                  !centeredEmptyLayout && "px-4 pb-4",
+                  // 浮窗形态下输入框外壳就是浮窗最外层，不留内边距。
+                  !centeredEmptyLayout && !floatingComposerDock && "px-4 pb-4",
                   !centeredEmptyLayout && summaryPanelInlineOffsetClassName,
                 )}
               >

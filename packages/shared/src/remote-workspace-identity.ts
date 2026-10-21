@@ -12,10 +12,12 @@
 // identity）需要还原出真实 workspacePath 作为会话 workingDirectory。
 import type { RemoteTarget } from "./remoteTarget.js";
 
-export type RemoteWorkspaceIdentityKind = "ssh" | "wsl" | "docker";
+export type RemoteWorkspaceIdentityKind = "ssh" | "wsl" | "docker" | "server";
 
 export interface ParsedRemoteWorkspaceIdentity {
   kind: RemoteWorkspaceIdentityKind;
+  /** kind=server 时的稳定 Source Server id。 */
+  sourceServerId?: string;
   /** 远端真实路径（posix 归一形态）。 */
   workspacePath: string;
 }
@@ -27,16 +29,54 @@ const AUTHORITY_SEGMENTS: Record<RemoteWorkspaceIdentityKind, number> = {
   ssh: 3,
   wsl: 1,
   docker: 1,
+  server: 1,
 };
 
 function isRemoteWorkspaceIdentityKind(value: string): value is RemoteWorkspaceIdentityKind {
-  return value === "ssh" || value === "wsl" || value === "docker";
+  return value === "ssh" || value === "wsl" || value === "docker" || value === "server";
 }
 
 function normalizeWorkspacePathForIdentity(workspacePath: string): string {
   const normalized = workspacePath.replace(/\\/g, "/").replace(/\/+/g, "/");
   const trimmed = normalized.replace(/^\/+|\/+$/g, "");
   return `/${trimmed}`;
+}
+
+function resolveServerIdentityId(target: Extract<RemoteTarget, { kind: "server" }>): string {
+  const explicit = target.serverId?.trim() || target.name?.trim();
+  if (explicit) {
+    return explicit;
+  }
+  try {
+    return new URL(target.url.trim()).host;
+  } catch {
+    return target.url.trim();
+  }
+}
+
+function normalizeServerIdForIdentity(serverId: string): string {
+  const normalized = serverId
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (!normalized) {
+    throw new Error("serverId must contain at least one identity-safe character");
+  }
+  return normalized;
+}
+
+export interface BuildServerRemoteWorkspaceIdentityOptions {
+  serverId: string;
+  workspacePath: string;
+}
+
+export function buildServerRemoteWorkspaceIdentity(
+  options: BuildServerRemoteWorkspaceIdentityOptions,
+): string {
+  const serverId = normalizeServerIdForIdentity(options.serverId);
+  const workspacePath = normalizeWorkspacePathForIdentity(options.workspacePath);
+  return `${REMOTE_IDENTITY_PREFIX}server:${serverId}:${workspacePath}`;
 }
 
 /**
@@ -57,6 +97,11 @@ export function buildRemoteWorkspaceIdentity(workspacePath: string, target: Remo
     }
     case "docker":
       return `remote:docker:${target.container}:${normalizedPath}`;
+    case "server":
+      return buildServerRemoteWorkspaceIdentity({
+        serverId: resolveServerIdentityId(target),
+        workspacePath: normalizedPath,
+      });
   }
 }
 
@@ -83,11 +128,13 @@ export function parseRemoteWorkspaceIdentity(
   // 逐段消费 authority；path 段可能含 ":"（理论上 posix 路径允许），
   // 因此不能整体 split——按段推进后取剩余整段为 path。
   let cursor = kindEnd + 1;
+  let sourceServerId: string | undefined;
   for (let i = 0; i < AUTHORITY_SEGMENTS[kind]; i++) {
     const next = rest.indexOf(":", cursor);
     if (next <= cursor) {
       return null;
     }
+    if (kind === "server" && i === 0) sourceServerId = rest.slice(cursor, next);
     cursor = next + 1;
   }
   // WSL identity 为区分默认用户与显式用户增加了可选 user 段，旧解析器
@@ -104,10 +151,24 @@ export function parseRemoteWorkspaceIdentity(
   if (!workspacePath.startsWith("/")) {
     return null;
   }
-  return { kind, workspacePath };
+  return { kind, workspacePath, ...(sourceServerId ? { sourceServerId } : {}) };
 }
 
 /** identity 是否是远程 workspace identity（可被 parseRemoteWorkspaceIdentity 解析）。 */
 export function isRemoteWorkspaceIdentity(identity: string): boolean {
   return parseRemoteWorkspaceIdentity(identity) !== null;
+}
+
+/** 虚拟项目的 host 身份；只在统一 identity 模块裁剪路径，业务层不得自行拆 authority。 */
+export function remoteHostIdFromWorkspaceIdentity(identity: string): string | null {
+  const parsed = parseRemoteWorkspaceIdentity(identity);
+  return parsed ? identity.slice(0, -(parsed.workspacePath.length + 1)) : null;
+}
+
+/** 从已登记的 Host 身份构造目录身份；不让业务模块拼接或解析 authority。 */
+export function buildRemoteHostWorkspaceIdentity(hostId: string, workspacePath: string): string {
+  const identity = `${hostId}:${normalizeWorkspacePathForIdentity(workspacePath)}`;
+  if (remoteHostIdFromWorkspaceIdentity(identity) !== hostId)
+    throw new Error("Invalid remote host identity");
+  return identity;
 }

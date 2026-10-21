@@ -52,23 +52,15 @@ export function createZCodeSessionService({
   const { withApiRetryRuntime } = createZCodeSessionApiRetryRuntimeTracker();
   const deferredDraftSessions = createZCodeDeferredDraftRegistry();
 
-  function notifySyncer(
-    target: ZCodeTaskTarget,
-    options?: {
-      includeSnapshot?: boolean;
-    },
-  ): void {
+  function notifySyncer(target: ZCodeTaskTarget): void {
     if (!taskIndexSyncer) {
       return;
     }
-    taskIndexSyncer.ensureSessionSubscription(
-      {
-        workspacePath: target.workspacePath,
-        workspaceIdentity: target.workspaceIdentity,
-        sessionId: target.sessionId,
-      },
-      options,
-    );
+    taskIndexSyncer.ensureSessionSubscription({
+      workspacePath: target.workspacePath,
+      workspaceIdentity: target.workspaceIdentity,
+      sessionId: target.sessionId,
+    });
   }
 
   function getSessionSnapshotDiagnostics(snapshot: ZCodeSessionStateSnapshot) {
@@ -336,7 +328,7 @@ export function createZCodeSessionService({
         );
       }
       const agentDurationMs = Date.now() - startedAt;
-      notifySyncer(agentParams, { includeSnapshot: shouldBroadcastSnapshot });
+      notifySyncer(agentParams);
       const broadcastStartedAt = Date.now();
       const modelOverride = agentParams.model
         ? formatModelPickerValue(agentParams.model)
@@ -487,7 +479,11 @@ export function createZCodeSessionService({
       return withApiRetryRuntime(await agentService.setMode(params));
     },
 
-    // onDynamicSessionEvent（renderer 侧旧 session/subscribe 订阅面）已删。
+    respondProviderRuntimeHeaders(params) {
+      return agentService.respondProviderRuntimeHeaders(params);
+    },
+
+    // M5 删波次 2：onDynamicSessionEvent（renderer 侧旧 session/subscribe 订阅面）已删。
     // v4 UI 的会话事件走 agentService 的 conversation 帧通道，本 service 不再向
     // agentService.onDynamicSessionEvent 建立任何订阅。
   };

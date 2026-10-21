@@ -26,6 +26,7 @@ import {
   shouldRecordModelIO,
 } from "./runner-debug.js";
 import {
+  createEmptyContextExceededError,
   getGenerateTextResultMetadata,
   isZeroOutputModelCompletion,
   logGenerateTextDiagnostics,
@@ -51,6 +52,7 @@ import type {
   AiSdkModelTextRequest,
   ResolvedAiSdkModel,
 } from "./runner-runtime.js";
+import { AccountRequestRetry } from "./account-request-retry.js";
 import { resolveModelForAttempt, RuntimeHeadersRefreshError } from "./runner-runtime-headers.js";
 import { retryAllowedByFailurePolicy } from "./workflow-model-failure-policy.js";
 import { modelFailureStatusFields, providerRequestIdFromHeaders } from "./runner-telemetry.js";
@@ -90,6 +92,7 @@ export async function runGenerateText(input: {
   const isDev = isDevelopmentModelIOEnv(input.env);
   let requestMessages = input.request.messages;
   let signatureRepairAttempted = false;
+  const authRetry = new AccountRequestRetry(input.request, input.resolved, input.logger);
   let emptyCompletionRetryCount = 0;
 
   for (
@@ -97,21 +100,18 @@ export async function runGenerateText(input: {
     retryAttemptLoopContinues(
       retryBudget,
       attempt,
-      input.retry.maxAttempts + Number(signatureRepairAttempted),
+      input.retry.maxAttempts + Number(signatureRepairAttempted) + authRetry.extraAttempts,
     );
     attempt += 1
   ) {
-    const retryBudgetAttempt =
-      attempt - Number(signatureRepairAttempted);
+    const retryBudgetAttempt = attempt - Number(signatureRepairAttempted) - authRetry.extraAttempts;
     const attemptRequest = { ...input.request, messages: requestMessages };
     const startedAt = Date.now();
     let resolved = input.resolved;
     let statusContext = createAttemptStatusContext(
       {
         ...baseStatusContext,
-        maxAttempts: statusMaxAttempts(
-          Number(signatureRepairAttempted),
-        ),
+        maxAttempts: statusMaxAttempts(Number(signatureRepairAttempted) + authRetry.extraAttempts),
       },
       attempt,
     );
@@ -160,7 +160,8 @@ export async function runGenerateText(input: {
     try {
       resolved = await resolveModelForAttempt({
         attempt,
-        request: attemptRequest,
+        reason: authRetry.takeReason(),
+        request: authRetry.prepareRequest(attemptRequest),
         resolveModel: input.resolveModel,
       });
       const anthropicMetadataUserId = await resolveAnthropicRequestMetadataUserId({
@@ -223,6 +224,18 @@ export async function runGenerateText(input: {
         ? serializeStructuredOutput(result)
         : result.text;
       const reasoning = normalizeReasoning(result.reasoning);
+      const contextError = createEmptyContextExceededError({
+        finishReason: result.finishReason,
+        rawFinishReason: result.rawFinishReason ?? result.providerMetadata?.rawFinishReason,
+        hasAssistantContent:
+          text.length > 0 ||
+          (reasoning ?? []).some(
+            (block) => block.text.length > 0 || Object.keys(block.providerOptions ?? {}).length > 0,
+          ),
+        toolCallCount: toolCalls?.length ?? 0,
+        usage,
+      });
+      if (contextError) throw contextError;
       const reasoningLength = (reasoning ?? []).reduce(
         (total, block) => total + block.text.length,
         0,
@@ -231,6 +244,9 @@ export async function runGenerateText(input: {
         input.request.preserveProviderStreamBoundaries !== true &&
         isZeroOutputModelCompletion({
           finishReason: result.finishReason,
+          rawFinishReason:
+            result.rawFinishReason ??
+            (result.providerMetadata as Record<string, unknown> | undefined)?.rawFinishReason,
           reasoningLength,
           textLength: text.length,
           toolCallCount: toolCalls?.length ?? 0,
@@ -374,7 +390,7 @@ export async function runGenerateText(input: {
         requestMessages = repairedMessages;
         statusContext = {
           ...statusContext,
-          maxAttempts: statusMaxAttempts(1),
+          maxAttempts: statusMaxAttempts(1 + authRetry.extraAttempts),
         };
       }
       const canRetryWithFailurePolicy =
@@ -387,7 +403,15 @@ export async function runGenerateText(input: {
               retryBudget,
               inspectProviderFailure(error).providerErrorCode,
             );
-      const canRetry = retryWithRepairedHistory || canRetryWithFailurePolicy;
+      const retryWithAuth = authRetry.claim(error, options === undefined);
+      if (retryWithAuth)
+        statusContext = {
+          ...statusContext,
+          maxAttempts: statusMaxAttempts(
+            Number(signatureRepairAttempted) + authRetry.extraAttempts,
+          ),
+        };
+      const canRetry = retryWithAuth || retryWithRepairedHistory || canRetryWithFailurePolicy;
 
       if (options) {
         recordGenerateTextDebug({
@@ -421,6 +445,7 @@ export async function runGenerateText(input: {
           ...modelFailureStatusFields(error, failure, options ? "response" : "prepare"),
           timestamp: new Date(completedAt).toISOString(),
           type: "model_request_failed",
+          ...(error instanceof AiSdkModelAdapterError && error.usage ? { usage: error.usage } : {}),
         },
         {
           ...statusPublishOptions(input, admission),
@@ -440,6 +465,19 @@ export async function runGenerateText(input: {
         throw toAdapterError(error, failure, statusContext, attempt, {
           errorPhase: requestInvocationCompleted ? "response" : "prepare",
         });
+      }
+
+      if (retryWithAuth) {
+        await publishRetryScheduledStatus(
+          input,
+          statusContext,
+          attempt,
+          0,
+          { ...failure, retryReason: ModelRetryReason.AuthRefresh },
+          requestHeaders,
+          responseHeaders,
+        );
+        continue;
       }
 
       if (retryWithRepairedHistory) {
@@ -599,11 +637,13 @@ function statusPublishOptions(
   input: {
     logger?: Logger;
     request: AiSdkModelTextRequest;
+    resolved?: Pick<ResolvedAiSdkModel, "requestObservations">;
     statusSink?: ModelStatusSink;
   },
   admission?: AttemptAdmission,
 ) {
   return {
+    requestObservations: input.resolved?.requestObservations,
     logger: input.logger,
     requestStatusSink: input.request.statusSink,
     statusSink: input.statusSink,

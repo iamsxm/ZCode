@@ -4,6 +4,7 @@ import type { PromptRuntimeCommand } from "../command-queue.js";
 import { createRuntimeCommandId } from "../command-queue.js";
 import type { AgentRuntimeInternal } from "../internal.js";
 import { enqueueCancellableRuntimeCommand } from "./runtime-command-submit.js";
+import { acceptSubmissionModelSelection, captureHighspeedFallbackSelection } from "./turn-model.js";
 import type {
   ActiveTurnStartReservation,
   ExecuteTurnOptions,
@@ -23,6 +24,23 @@ export async function admitPrompt(
   attachments?: Parameters<AgentRuntimeInternal["executeTurn"]>[1],
   options?: PromptAdmissionOptions,
 ): Promise<PromptAdmissionReceipt> {
+  if (options?.requireQueue === true) {
+    // Bug 根因：Highspeed 临时 provider 只能在独立 turn 的提升边界安装。如果仅依据
+    // Bootstrap 的 busy 快照决定是否排队，状态在跨层 await 期间转为空闲会误用普通模型启动。
+    return await this.enqueueDeferredInput({
+      attachments,
+      commandKind: options.commandKind,
+      delivery: "queue",
+      input,
+      inputId: options.inputId,
+      intent: admissionIntent(options.intent, "queue"),
+      modelSelectionScope: options.modelExecution?.selectionScope,
+      highspeedFallbackSelection: options.modelExecution?.selectionFallback?.target,
+      queryId: options.queryId,
+      toolDisallowlist: options.toolDisallowlist,
+      traceContext: options.traceContext,
+    });
+  }
   const promotionLeaseOnly =
     options?.requireIdle === true &&
     this.foregroundPromotionLease !== undefined &&
@@ -97,11 +115,26 @@ export async function admitPrompt(
     turnId,
   };
   this.reserveTurnStart(turnId, turnTraceContext, "regular");
+  let selectionAccepted = Promise.resolve();
 
+  if (options?.modelExecution) {
+    options = {
+      ...options,
+      modelExecution: captureHighspeedFallbackSelection(this, options.modelExecution),
+    };
+  }
   const executeOptions = options as ExecuteTurnOptions | undefined;
   const completion = enqueueCancellableRuntimeCommand<TurnResult, PromptRuntimeCommand>(this, {
     abortSignal: options?.abortSignal,
     onCommandCancelled: () => this.releaseTurnStart(turnId),
+    onCommandAccepted: () => {
+      selectionAccepted = acceptSubmissionModelSelection(
+        this,
+        options?.intent,
+        turnTraceContext,
+        options?.modelExecution,
+      );
+    },
     createCommand: ({ reject, resolve }) => ({
       attachments,
       createdAt: new Date(),
@@ -122,6 +155,7 @@ export async function admitPrompt(
   });
   // admission 已经完成；执行失败由现有 turn 事件/调用方消费，不制造 unhandled rejection。
   void completion.catch(() => undefined);
+  await selectionAccepted;
   return { completion, kind: "started", turnId };
 }
 

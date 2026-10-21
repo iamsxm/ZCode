@@ -10,7 +10,7 @@ const DEFAULT_LOCK_OWNERLESS_GRACE_MS = 100;
 const DEFAULT_LOCK_MAX_WAIT_MS = 8_000;
 const DEFAULT_TEMP_FILE_STALE_MS = 60_000;
 
-interface AtomicWriteTextOptions {
+export interface AtomicWriteTextOptions {
   renameRetryDelaysMs?: readonly number[];
   lockRetryDelaysMs?: readonly number[];
   lockOwnerlessGraceMs?: number;
@@ -19,6 +19,27 @@ interface AtomicWriteTextOptions {
   useFileLock?: boolean;
   beforeRename?: () => void | Promise<void>;
   runRename?: (renameFile: () => Promise<void>) => Promise<void>;
+}
+
+export async function withAtomicFileLock<T>(
+  filePath: string,
+  task: () => Promise<T>,
+  options?: Pick<
+    AtomicWriteTextOptions,
+    "lockRetryDelaysMs" | "lockOwnerlessGraceMs" | "lockMaxWaitMs"
+  >,
+): Promise<T> {
+  const releaseLock = await acquireFileLock(
+    filePath,
+    options?.lockRetryDelaysMs ?? DEFAULT_LOCK_RETRY_DELAYS_MS,
+    options?.lockOwnerlessGraceMs ?? DEFAULT_LOCK_OWNERLESS_GRACE_MS,
+    options?.lockMaxWaitMs ?? DEFAULT_LOCK_MAX_WAIT_MS,
+  );
+  try {
+    return await task();
+  } finally {
+    await releaseLock();
+  }
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -100,7 +121,8 @@ async function cleanupStaleTempFilesForTarget(
 
 /**
  * 使用临时文件 + rename 实现原子写入。
- * rename 在同文件系统上是原子的，可避免 read-modify-write 并发时的数据覆盖风险。
+ * rename 在同文件系统上是原子的，避免读者看到半份内容；read-modify-write 需由调用方
+ * 用 withAtomicFileLock 包住读取、合并及写入，并给内部原子写传 useFileLock: false。
  * 临时文件写在目标文件同目录下，避免 Windows 跨卷 rename 失败。
  */
 export async function atomicWriteText(

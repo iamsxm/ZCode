@@ -34,9 +34,6 @@ export const parseGlobalArgs = (argv: string[]) =>
       "memory-bench": {
         type: "boolean",
       },
-      "enable-workflow": {
-        type: "boolean",
-      },
       attach: {
         multiple: true,
         type: "string",
@@ -64,6 +61,7 @@ export const parseGlobalArgs = (argv: string[]) =>
         short: "f",
         type: "boolean",
       },
+      "toolsearch-mode": { type: "string" },
       "force-mcs": {
         type: "boolean",
       },
@@ -84,7 +82,10 @@ export const parseGlobalArgs = (argv: string[]) =>
       surface: {
         type: "string",
       },
-
+      "workflow-mode": {
+        type: "string",
+      },
+      // `zcode plugins` 子命令旗标：strict 解析器要求
       // 在全局注册，run.ts 收集后透传给 plugins-command，不污染其他命令的选项语义。
       all: {
         short: "a",

@@ -9,6 +9,7 @@ import {
   ApiKeyAccessConfig,
   ModelConfig,
   ModelConfigRules,
+  ModelOptionSpecsConfig,
   ModelPropertiesConfig,
   ProviderApiConfig,
   ProviderConfig,
@@ -50,7 +51,7 @@ function resolveLegacyProviderApiType(
 }
 
 /** 把旧 CLI 用户文件中的显式 Provider 定义迁移到新的 Personal Overlay。 */
-function importLegacyCliPersonalProviderConfig(
+export function importLegacyCliPersonalProviderConfig(
   input: LegacyCliPersonalProviderConfigImportInput,
 ): ProviderConfigLayerUpdate {
   const runtimePatch = parseLegacyCliModelConfig(input.input);
@@ -109,12 +110,21 @@ function importLegacyCliPersonalProviderConfig(
       }),
     });
     for (const member of members) {
-      if (member.contextWindow === undefined) continue;
+      if (member.contextWindow === undefined && member.maxOutputTokens === undefined) continue;
       models = models.setExact(
         providerId,
         member.modelId,
         new ModelConfig({
-          properties: new ModelPropertiesConfig({ contextWindow: member.contextWindow }),
+          ...(member.contextWindow !== undefined
+            ? { properties: new ModelPropertiesConfig({ contextWindow: member.contextWindow }) }
+            : {}),
+          ...(member.maxOutputTokens !== undefined
+            ? {
+                optionSpecs: new ModelOptionSpecsConfig({
+                  maxOutputTokens: { max: member.maxOutputTokens },
+                }),
+              }
+            : {}),
         }),
       );
     }
@@ -143,7 +153,7 @@ export async function readLegacyCliPersonalProviderConfig(input: {
 }
 
 /** 旧 CLI 用户文件中的 main model 只迁移为 Environment 默认选择。 */
-function importLegacyCliConfiguredDefault(input: unknown): ModelSelection | null {
+export function importLegacyCliConfiguredDefault(input: unknown): ModelSelection | null {
   const main = parseLegacyCliModelConfig(input).model?.main;
   if (!main || main.provider === RETIRED_ZAPI_PROVIDER_ID) return null;
   return Object.freeze({
@@ -157,6 +167,7 @@ type LegacyCliProvider = NonNullable<LegacyCliModelConfigProjection["provider"]>
 interface LegacyCliModelMember {
   readonly modelId: string;
   readonly contextWindow?: number;
+  readonly maxOutputTokens?: number;
 }
 
 function collectLegacyCliModelMembers(
@@ -170,9 +181,17 @@ function collectLegacyCliModelMembers(
     if (!modelId || seen.has(modelId)) continue;
     seen.add(modelId);
     const contextWindow = model.contextWindow ?? model.limit?.context;
+    // 评测仍使用旧 CLI 文件显式设定预算；仅在首次导入保留数值，map 由正式规则继承。
+    // 沿用 limit > options > 顶层优先级，不能因缺少 context 而丢掉独立输出上限。
+    const maxOutputTokens = [
+      model.limit?.output,
+      model.options?.max_tokens,
+      model.maxOutputTokens,
+    ].find(isPositiveInteger);
     members.push({
       modelId,
       ...(isPositiveInteger(contextWindow) ? { contextWindow } : {}),
+      ...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
     });
   }
   return members;

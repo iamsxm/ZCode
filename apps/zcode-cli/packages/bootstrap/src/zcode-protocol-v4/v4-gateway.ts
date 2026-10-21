@@ -1,3 +1,8 @@
+import {
+  pluginUiToolResultNotificationSchema,
+  type PluginUiToolResultNotification,
+} from "@zcode/shared/mcp-apps";
+import { randomUUID } from "node:crypto";
 import { LocalTtftRecorder } from "./local-ttft.js";
 import { localTtftNow, localTtftFactsSchema } from "@zcode/shared/zcode-protocol-v4";
 import {
@@ -17,10 +22,10 @@ import {
 import type {
   DynamicWorkflowRunArtifact,
   DynamicWorkflowRunArtifactBytes,
-  DynamicWorkflowRunArtifactItem,
+  DynamicWorkflowRunArtifactItemsResult,
   DynamicWorkflowRunWorkspaceNode,
   DynamicWorkflowRunWorkspaceNodeResult,
-  DynamicWorkflowRunEvent,
+  DynamicWorkflowRunEventsResult,
   DynamicWorkflowRunSessionSummary,
   MessageWithParts,
   SessionEvent,
@@ -46,6 +51,8 @@ import type {
   RoutedTopicFrame,
   RoutedTopicWireFrame,
   SessionSummary,
+  SessionsIndexReconcileParams,
+  SessionsIndexReconcileResult,
   SessionsIndexTopicFrame,
   SubscribeAck,
   V4AttachmentBeginResult,
@@ -85,6 +92,8 @@ import {
   measureTopicNotificationEnvelopeBytes,
   parseConversationTopic,
   parseSessionsIndexTopic,
+  sessionsIndexReconcileParamsSchema,
+  sessionsIndexReconcileResultSchema,
   parseWorkspaceConfigTopic,
   v4AttachmentAbortParamsSchema,
   v4AttachmentBeginParamsSchema,
@@ -113,6 +122,7 @@ import {
   v4ConversationWorkflowRunWorkspaceParamsSchema,
   v4ConversationWorkflowRunWorkspaceResultSchema,
   WORKFLOW_WORKSPACE_LIMITS,
+  WORKFLOW_RUN_EVENTS_PAGE_LIMITS,
   v4ConversationWorkflowRunEventsParamsSchema,
   v4ConversationWorkflowRunEventsResultSchema,
   v4ConversationWorkflowRunsParamsSchema,
@@ -125,6 +135,7 @@ import {
 import { AttachmentUploadRegistry } from "./attachment-upload-registry.js";
 import {
   ColdSessionResumeCoordinator,
+  V4SubscribeSessionUnavailableError,
   type ColdSessionResumeOutcome,
 } from "./cold-session-resume.js";
 import { CommandInbox } from "./command-inbox.js";
@@ -162,6 +173,7 @@ function rowTargetActionForCommand(
     case "retryTurn":
     case "applyFileRewind":
     case "setAssistantFeedback":
+    case "setHighspeedMetrics":
       return type;
     default:
       return null;
@@ -181,7 +193,7 @@ interface PersistedEventsLoadResult {
   usageSeed?: SessionUsageSeed | null;
 }
 
-type V4GatewayErrorContext = Record<string, unknown>;
+export type V4GatewayErrorContext = Record<string, unknown>;
 
 /**
  * 一条已读回的**整份字节**，供分块读取复用。
@@ -213,10 +225,14 @@ export interface V4GatewayHost {
    * V4 冷恢复钩子。gateway 用同一个 READY promise 包住 runtime activation 与 projection
    * hydration；宿主只负责恢复 record。
    */
+  loadPersistedMessages?(sessionId: string): Promise<MessageWithParts[]>;
+  retainSessionRuntime?(sessionId: string): Promise<() => void>;
   resumePersistedSession?(
     sessionId: string,
     resumeThoughtLevel?: string,
     workspace?: ZCodeWorkspaceRef,
+    additionalDirectories?: string[],
+    persistedMessages?: MessageWithParts[],
   ): Promise<ColdSessionResumeOutcome>;
   /**
    * 下行物理帧出口（宿主负责投递：stdio notification / MessagePort / ws）。
@@ -230,6 +246,8 @@ export interface V4GatewayHost {
   emitLocalTtftFacts?(facts: import("@zcode/shared").LocalTtftFacts): void;
   /** 当前进程 live request_access 权限事实；不缓存、不进入 topic replay。 */
   emitCuaPermissionObservation?(observation: CuaPermissionObservation): void;
+  /** 成功 UI 工具结果的窗口副作用；与 conversation 订阅、历史 hydration 无关。 */
+  emitPluginUiToolResult?(result: PluginUiToolResultNotification): void;
   /**
    * sessions-index：会话 → 所属 workspaceId（列表 topic 的分桶键）。
    * 未实现（旧宿主）→ sessions-index 路径整体不激活（no-op），不影响 conversation。
@@ -239,6 +257,7 @@ export interface V4GatewayHost {
   getSessionIndexMeta?(sessionId: string): {
     createdAt: number;
     lastActivityAt: number;
+    lastOutcome?: SessionSummary["lastOutcome"];
     parentSessionId?: string;
   } | null;
   /**
@@ -276,6 +295,7 @@ export interface V4GatewayHost {
    * store 读取是异步的，故允许返回 Promise（gateway 订阅时 await；同步 stub 直接返回数组）。
    */
   getStoredSessionSummaries?(workspaceId: string): Promise<SessionSummary[]> | SessionSummary[];
+  reconcileSessions?(params: SessionsIndexReconcileParams): Promise<SessionsIndexReconcileResult>;
   /**
    * 3.3.6 远端历史兼容：用精确 task allowlist 幂等认领后返回严格 identity 摘要。
    * 非远端 workspace 返回 null；失败可降级为空数组，后续携带 allowlist 的订阅会重试。
@@ -322,6 +342,12 @@ export interface V4GatewayHost {
   invalidatePersistentCommandFacts?(sessionId: string): void;
   /** canonical goal complete 已进入 projection；宿主副作用必须 detached，禁止阻塞 ingest。 */
   onTargetCompleted?(sessionId: string, event: SessionEvent): void;
+  /** Highspeed 真实耗时在 CLI 终态落 transcript；宿主副作用必须 detached。 */
+  onHighspeedTurnTerminal?(
+    sessionId: string,
+    event: SessionEvent,
+    snapshot: ConversationSnapshot,
+  ): void;
   /** 完整 chunk transaction commit 后一次性写 session artifact。 */
   putSessionAttachment?(
     sessionId: string,
@@ -376,8 +402,8 @@ export interface V4GatewayHost {
    */
   listDynamicWorkflowRunEvents?(
     sessionId: string,
-    input: { runId: string; afterSequence?: number; limit?: number },
-  ): Promise<DynamicWorkflowRunEvent[]>;
+    input: { runId: string; afterSequence?: number; limit?: number; maxBytes?: number },
+  ): Promise<DynamicWorkflowRunEventsResult>;
   /**
    * dwf run 的枚举面（重启后的发现查询）。
    * 缺席条件同 {@link listDynamicWorkflowRunEvents}。
@@ -398,8 +424,15 @@ export interface V4GatewayHost {
   ): Promise<readonly DynamicWorkflowRunArtifact[] | undefined>;
   listDynamicWorkflowRunArtifactItems?(
     sessionId: string,
-    input: { runId: string; artifactId: string; afterSequence?: number; limit: number },
-  ): Promise<readonly DynamicWorkflowRunArtifactItem[]>;
+    input: {
+      runId: string;
+      artifactId: string;
+      afterSequence?: number;
+      limit: number;
+      maxBytes: number;
+      fields?: readonly string[];
+    },
+  ): Promise<DynamicWorkflowRunArtifactItemsResult>;
   readDynamicWorkflowRunArtifact?(
     sessionId: string,
     input: { runId: string; artifactId: string; version: number },
@@ -432,7 +465,7 @@ export interface V4GatewayHost {
   onError?(scope: string, error: unknown, context?: V4GatewayErrorContext): void;
 }
 
-interface ConversationV4GatewayOptions {
+export interface ConversationV4GatewayOptions {
   now?: () => number;
   /** logEpoch 生成器（默认进程内随机；测试注入固定值保证确定性）。 */
   createLogEpoch?: (sessionId: string) => string;
@@ -479,7 +512,7 @@ interface ProjectionEventCommitWaiter {
 const PROJECTION_EVENT_COMMIT_TIMEOUT_MS = 25_000;
 const MAX_TELEMETRY_EVENT_IDS = 2_000;
 /** detached subagent child 终态后无订阅者时，publisher 由低频 tick 释放前的保留时长。 */
-const DETACHED_CHILD_PUBLISHER_GRACE_MS = 120_000;
+export const DETACHED_CHILD_PUBLISHER_GRACE_MS = 120_000;
 
 class ProjectionEventCommitWaitError extends Error {
   constructor(
@@ -502,14 +535,14 @@ class ProjectionEventCommitWaitError extends Error {
  * server 内部分派结果：initial frame 只供 request-scoped post-response outbox
  * 消费，公共 JSON-RPC result schema 始终严格为 `{ ack }`。
  */
-interface V4SubscribeDispatchResult<TFrame> {
+export interface V4SubscribeDispatchResult<TFrame> {
   ack: SubscribeAck & { openTiming?: ConversationOpenTiming };
   initialFrame: TFrame | null;
   initialWires: RoutedTopicWireFrame[];
   commit(): boolean;
 }
 
-function encodeReservedTopicFrame(
+export function encodeReservedTopicFrame(
   reservation: TopicFrameReservation<RoutedTopicFrame>,
 ): RoutedTopicWireFrame[] {
   return encodeTopicWireFrames(reservation.frame, {
@@ -520,6 +553,16 @@ function encodeReservedTopicFrame(
     logicalFrameOrdinal: reservation.logicalFrameOrdinal,
     measurePhysicalFrameBytes: (wire) => measureTopicNotificationEnvelopeBytes(wire).maxBytes,
   }) as RoutedTopicWireFrame[];
+}
+
+/** 所有 physical wire 都被下游接受后才 commit publisher 水位。 */
+export function emitReservedTopicFrame<F extends RoutedTopicFrame>(
+  reservation: TopicFrameReservation<F>,
+  emit: (wire: RoutedTopicWireFrame) => unknown,
+): boolean {
+  const wires = encodeReservedTopicFrame(reservation as TopicFrameReservation<RoutedTopicFrame>);
+  for (const wire of wires) emit(wire);
+  return reservation.commit();
 }
 
 function subscriptionRouteKey(topic: string, subscriptionId: string, connectionId: string): string {
@@ -567,6 +610,14 @@ export class ConversationV4Gateway {
   /** 首次 hydration 按 session 单飞；并发 pane 共享同一份重建结果。 */
   private readonly hydrationInFlight = new Map<string, Promise<ConversationTopicPublisher>>();
   /** cold activation 到 hydration 的 READY 水位；只阻塞本次恢复期间的 command/query。 */
+  private readonly historyOpenings = new Map<
+    string,
+    {
+      history: Promise<ConversationTopicPublisher>;
+      start: () => void;
+      cancel: () => void;
+    }
+  >();
   private readonly readyFlights = new Map<string, Promise<ConversationTopicPublisher>>();
   /** load await 窗口内的 raw accepted events；重建后按 cursor/eventId 补回。 */
   private readonly hydrationBuffers = new Map<string, HydrationBuffer>();
@@ -646,8 +697,22 @@ export class ConversationV4Gateway {
     this.createLogEpoch = options.createLogEpoch ?? defaultLogEpoch;
     this.coldResume = new ColdSessionResumeCoordinator(host);
     this.inbox = new CommandInbox({
+      prepareDecision: async (envelope) => {
+        if (
+          envelope.sessionId &&
+          (envelope.type === "renameSession" || envelope.type === "deleteSession") &&
+          !this.host.sessionExists(envelope.sessionId)
+        ) {
+          // 历史行的重命名 / 删除仍由 CLI 原命令写持久事实；只在真实命令 admission 后冷恢复。
+          await this.ensureColdReadyPublisher(envelope.sessionId);
+        }
+      },
       getRevision: (sessionId) => {
-        if (!this.host.sessionExists(sessionId)) return null;
+        if (
+          !this.host.sessionExists(sessionId) &&
+          !this.publishers.get(sessionId)?.getSnapshot().runtimeInitialization
+        )
+          return null;
         // 已知会话但尚无事件 → 投影未建，revision 视为 0（draft 起点）。
         return this.publishers.get(sessionId)?.getSnapshot().revision ?? 0;
       },
@@ -665,6 +730,22 @@ export class ConversationV4Gateway {
         return resolution.status === "stale"
           ? { verdict: "stale", reasonCode: resolution.reasonCode }
           : { verdict: "reject", reasonCode: resolution.reasonCode };
+      },
+      // 在 inbox 去重之后拒绝新执行，不把未就绪输入接受进运行队列。
+      guard: (envelope) => {
+        const initialization =
+          envelope.sessionId === null
+            ? undefined
+            : this.publishers.get(envelope.sessionId)?.getSnapshot().runtimeInitialization;
+        return initialization && initialization.status !== "ready"
+          ? {
+              verdict: "reject",
+              reasonCode:
+                initialization.status === "failed"
+                  ? "guard.runtimeInitializationFailed"
+                  : "guard.runtimeInitializing",
+            }
+          : { verdict: "allow" };
       },
       lookupTranscriptCommand: (key) => this.host.lookupTranscriptCommand?.(key) ?? null,
       lookupTimelineCommand: (key) => this.host.lookupTimelineCommand?.(key) ?? null,
@@ -950,6 +1031,40 @@ export class ConversationV4Gateway {
       return;
     }
     this.resolveProjectionEventCommit(sessionId, String(event.id));
+    // 原因：后台会话没有卡片/订阅时无法创建 guest。只在 live 投影提交后投递，
+    // 从同一权威工具行取输入和 UI 描述；历史 hydration 直接写 publisher，不走此入口。
+    if (event.type === SessionEventType.ToolCallResult && this.host.emitPluginUiToolResult) {
+      const toolCallId = (event.payload as { toolCallId: string }).toolCallId;
+      const row = publisher
+        .getSnapshot()
+        .rows.window.find((row) => row.kind === "toolCall" && row.toolCallId === toolCallId);
+      if (
+        row?.kind === "toolCall" &&
+        row.status === "success" &&
+        row.display?.kind === "mcp_tool"
+      ) {
+        const result = pluginUiToolResultNotificationSchema.safeParse({
+          sessionId,
+          toolCallId,
+          serverName: row.display.serverName,
+          ui: row.display.ui,
+          ...(row.input && typeof row.input === "object" && !Array.isArray(row.input)
+            ? { input: row.input }
+            : {}),
+        });
+        if (result.success) this.host.emitPluginUiToolResult(result.data);
+      }
+    }
+    if (
+      !this.hydrationBuffers.has(sessionId) &&
+      (event.type === SessionEventType.TurnComplete || event.type === SessionEventType.TurnError)
+    ) {
+      try {
+        this.host.onHighspeedTurnTerminal?.(sessionId, event, publisher.getSnapshot());
+      } catch (error) {
+        this.host.onError?.("v4.projection.highspeedMetrics", error);
+      }
+    }
     if (
       event.type === SessionEventType.TargetChanged &&
       (event.payload as TargetChangedPayload).target?.status === "complete"
@@ -1123,12 +1238,14 @@ export class ConversationV4Gateway {
   private resolveIndexMeta(sessionId: string): {
     createdAt: number;
     lastActivityAt: number;
+    lastOutcome?: SessionSummary["lastOutcome"];
     parentSessionId?: string;
   } {
     const meta = this.host.getSessionIndexMeta?.(sessionId);
     return {
       createdAt: meta?.createdAt ?? 0,
       lastActivityAt: meta?.lastActivityAt ?? this.now(),
+      ...(meta?.lastOutcome ? { lastOutcome: meta.lastOutcome } : {}),
       ...(meta?.parentSessionId ? { parentSessionId: meta.parentSessionId } : {}),
     };
   }
@@ -1166,6 +1283,12 @@ export class ConversationV4Gateway {
     const dispatch = await this.subscribeSessionsIndexReserved(rawParams);
     dispatch.commit();
     return dispatch;
+  }
+
+  async reconcileSessions(rawParams: unknown): Promise<SessionsIndexReconcileResult> {
+    const params = sessionsIndexReconcileParamsSchema.parse(rawParams);
+    if (!this.host.reconcileSessions) throw new Error("sessionsIndex/reconcile is unavailable");
+    return sessionsIndexReconcileResultSchema.parse(await this.host.reconcileSessions(params));
   }
 
   async subscribeSessionsIndexReserved(
@@ -1393,15 +1516,37 @@ export class ConversationV4Gateway {
     // - 有 publisher 且事件日志完整（流式 live）→ 保留，重放会双计且打断流。
     const restoreStartedAt = performance.now();
     const existingReady = this.readyFlights.get(sessionId);
-    const publisher = existingReady
-      ? await existingReady
-      : !isLiveConversation
-        ? await this.ensureColdReadyPublisher(
+    const historyFirst = params.historyFirst === true && Boolean(this.host.loadPersistedMessages);
+    const initialState = this.publishers.get(sessionId)?.getSnapshot().runtimeInitialization;
+    if (!historyFirst && initialState?.status === "failed") {
+      throw new V4SubscribeSessionUnavailableError(
+        sessionId,
+        "fault.subscribe.resumeFailed",
+        initialState.message,
+      );
+    }
+    const publisher =
+      historyFirst &&
+      (this.historyOpenings.has(sessionId) ||
+        initialState?.status === "failed" ||
+        (!isLiveConversation && !existingReady))
+        ? await this.ensureHistoryReadyPublisher(
             sessionId,
             params.resumeThoughtLevel,
             params.workspace,
+            params.additionalDirectories,
+            params.retryInitialization,
           )
-        : await this.hydratePublisher(sessionId);
+        : existingReady
+          ? await existingReady
+          : !isLiveConversation
+            ? await this.ensureColdReadyPublisher(
+                sessionId,
+                params.resumeThoughtLevel,
+                params.workspace,
+                params.additionalDirectories,
+              )
+            : await this.hydratePublisher(sessionId);
     const cliSessionRestoreMs = !isLiveConversation
       ? Math.max(0, Math.round(performance.now() - restoreStartedAt))
       : undefined;
@@ -1429,12 +1574,17 @@ export class ConversationV4Gateway {
       dispatch = this.subscribeDispatch(result.ack, result.reservation, () => {
         const state = this.flushStates.get(routeKey);
         if (state) this.scheduleFlush(routeKey, state, publisher);
+        this.historyOpenings.get(sessionId)?.start();
       });
       dispatch.ack = {
         ...dispatch.ack,
         openTiming: {
           version: 1,
-          ...(cliSessionRestoreMs !== undefined ? { cliSessionRestoreMs } : {}),
+          ...(cliSessionRestoreMs !== undefined
+            ? historyFirst
+              ? { historyReadyMs: cliSessionRestoreMs }
+              : { cliSessionRestoreMs }
+            : {}),
           initialFrameEncodeMs: Math.max(
             0,
             Math.round(performance.now() - initialFrameEncodeStartedAt),
@@ -1570,11 +1720,16 @@ export class ConversationV4Gateway {
   async rowsRange(rawParams: unknown): Promise<V4ConversationRowsRangeResult> {
     const params = v4ConversationRowsRangeParamsSchema.parse(rawParams);
     const existingReady = this.readyFlights.get(params.sessionId);
-    const publisher = existingReady
-      ? await existingReady
-      : !this.hasLiveConversation(params.sessionId)
-        ? await this.ensureColdReadyPublisher(params.sessionId)
-        : await this.hydratePublisher(params.sessionId);
+    const publisher = this.historyOpenings.has(params.sessionId)
+      ? await this.historyOpenings.get(params.sessionId)!.history
+      : this.publishers.get(params.sessionId)?.getSnapshot().runtimeInitialization?.status ===
+          "failed"
+        ? this.publishers.get(params.sessionId)!
+        : existingReady
+          ? await existingReady
+          : !this.hasLiveConversation(params.sessionId)
+            ? await this.ensureColdReadyPublisher(params.sessionId)
+            : await this.hydratePublisher(params.sessionId);
     return publisher.getRowsRange(
       {
         ...(params.beforeRowId !== undefined ? { beforeRowId: params.beforeRowId } : {}),
@@ -1603,8 +1758,9 @@ export class ConversationV4Gateway {
    * 与 rows/range、plans 同族：只读、无状态、超时重发安全。刻意**不是** v4 command——
    * command 的 ACK 结果是那个封闭的「变更结果」判别联合，一页只读事件不属于那个词汇表。
    *
-   * `hasMore` 由「取满 limit」判定：多读一条来确认后面还有，比让 renderer 靠"这页正好满"
-   * 猜测更可靠（正好取尽时不会白翻一页空的）。
+   * 一页的条数与字节两道界在这里定（docs/execution-engine.md「Reading the journal」）：条数取
+   * 调用方的 limit，缺省为协议上限；字节恒为协议上限，renderer 不能放宽。`hasMore` 由存储层
+   * 判定——页可能因字节提前收尾，「取满 limit」已经不是判据。
    */
   async workflowRunEvents(rawParams: unknown): Promise<V4ConversationWorkflowRunEventsResult> {
     const params = v4ConversationWorkflowRunEventsParamsSchema.parse(rawParams);
@@ -1612,18 +1768,13 @@ export class ConversationV4Gateway {
       throw new V4CapabilityUnsupportedError("listDynamicWorkflowRunEvents", params.sessionId);
     }
     await this.ensureHostRecordForJournalRead(params.sessionId);
-    const limit = params.limit;
-    const events = await this.host.listDynamicWorkflowRunEvents(params.sessionId, {
+    const page = await this.host.listDynamicWorkflowRunEvents(params.sessionId, {
       runId: params.runId,
       ...(params.afterSequence === undefined ? {} : { afterSequence: params.afterSequence }),
-      // 多取一条只为判定 hasMore；它不进结果页。
-      ...(limit === undefined ? {} : { limit: limit + 1 }),
+      limit: params.limit ?? WORKFLOW_RUN_EVENTS_PAGE_LIMITS.maxEvents,
+      maxBytes: WORKFLOW_RUN_EVENTS_PAGE_LIMITS.maxBytes,
     });
-    const hasMore = limit !== undefined && events.length > limit;
-    return v4ConversationWorkflowRunEventsResultSchema.parse({
-      events: hasMore ? events.slice(0, limit) : events,
-      hasMore,
-    });
+    return v4ConversationWorkflowRunEventsResultSchema.parse(page);
   }
 
   /**
@@ -1670,8 +1821,8 @@ export class ConversationV4Gateway {
   /**
    * 预置看板的取数面：喂给某个产物的 `report` 条目分页。
    *
-   * `limit` 的**缺省与钳制都在这里**（存储层精确兑现、绝不自造页大小也绝不再钳）；`hasMore` 照 workflowRunEvents 的惯例多取一条判定——判据绝不能是「这页正好满」，
-   * 那会在条目数恰好等于 limit 时误报，让看板去翻一页不存在的数据。
+   * 条数的**缺省与钳制**、以及字节上界都在这里定（存储层精确兑现、绝不自造页大小也绝不再钳）。`fields` 原样下传：看板只要 spec 点名的字段，由 SQLite 取出；`hasMore` 由存储层判定——页可能因字节提前收尾，所以判据绝不能是
+   * 「这页正好满」，也不再是网关多取一条。
    */
   async workflowRunArtifactData(
     rawParams: unknown,
@@ -1691,18 +1842,15 @@ export class ConversationV4Gateway {
         WORKFLOW_ARTIFACT_LIMITS.maxItemsPerPage,
       ),
     );
-    const items = await this.host.listDynamicWorkflowRunArtifactItems(params.sessionId, {
+    const page = await this.host.listDynamicWorkflowRunArtifactItems(params.sessionId, {
       runId: params.runId,
       artifactId: params.artifactId,
       ...(params.afterSequence === undefined ? {} : { afterSequence: params.afterSequence }),
-      // 多取一条只为判定 hasMore；它不进结果页。
-      limit: limit + 1,
+      limit,
+      maxBytes: WORKFLOW_ARTIFACT_LIMITS.maxPageBytes,
+      ...(params.fields === undefined ? {} : { fields: params.fields }),
     });
-    const hasMore = items.length > limit;
-    return v4ConversationWorkflowRunArtifactDataResultSchema.parse({
-      items: hasMore ? items.slice(0, limit) : items,
-      hasMore,
-    });
+    return v4ConversationWorkflowRunArtifactDataResultSchema.parse(page);
   }
 
   /**
@@ -1893,6 +2041,10 @@ export class ConversationV4Gateway {
    * 双写把序列账搞乱，transcript 从此定格（症状是直播冻结在「已工作 xx 秒」）。
    */
   private async ensureHostRecordForJournalRead(sessionId: string): Promise<void> {
+    const ready = this.readyFlights.get(sessionId);
+    if (ready) await ready;
+    if (this.publishers.get(sessionId)?.getSnapshot().runtimeInitialization?.status === "failed")
+      throw new Error("fault.subscribe.resumeFailed");
     if (this.hasLiveConversation(sessionId)) return;
     await this.coldResume.ensureResumed(sessionId);
   }
@@ -2182,7 +2334,15 @@ export class ConversationV4Gateway {
   ): { attachment: AttachmentRef; messageId?: string; attachmentIndex?: number } | null {
     const isPreviewable = (attachment: AttachmentRef) => {
       const mime = attachment.mime.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-      return mime.startsWith("image/") || mime.startsWith("video/") || mime === "application/pdf";
+      // 根因：原预览仅放行图片、视频和 PDF，文本附件即使归属当前行也被拒绝。
+      // 文本只开放既有材料标记，后续仍须通过权威行、附件索引和 ref 的归属校验。
+      return (
+        mime.startsWith("image/") ||
+        mime.startsWith("video/") ||
+        mime === "application/pdf" ||
+        (mime === "text/plain" &&
+          (attachment.sourceKind === "topic-history" || attachment.sourceKind === "clipboard-text"))
+      );
     };
     const matchesRef = (attachment: AttachmentRef) =>
       attachment.ref === ref || attachment.previewRef === ref;
@@ -2287,7 +2447,11 @@ export class ConversationV4Gateway {
           !allowGeneric &&
           !resultMime.startsWith("image/") &&
           !resultMime.startsWith("video/") &&
-          resultMime !== "application/pdf"
+          resultMime !== "application/pdf" &&
+          !(
+            resultMime === "text/plain" &&
+            mime.split(";", 1)[0]?.trim().toLowerCase() === "text/plain"
+          )
         ) {
           throw new ZCodeAttachmentFaultError(ZCODE_ATTACHMENT_FAULT_CODES.previewNotMedia);
         }
@@ -2392,7 +2556,7 @@ export class ConversationV4Gateway {
       const parsed = parseCommandEnvelope(rawParams);
       const sessionId = parsed.ok ? parsed.envelope.sessionId : null;
       const ready = sessionId === null ? undefined : this.readyFlights.get(sessionId);
-      if (ready) await ready;
+      if (ready && sessionId !== null && !this.historyOpenings.has(sessionId)) await ready;
     }
 
     const outcome = await this.inbox.handle(rawParams);
@@ -2483,6 +2647,11 @@ export class ConversationV4Gateway {
         this.inbox.pinLiveInput(outcome.envelope.sessionId, durableInputIntent);
       }
       const result = await this.host.executeCommand(outcome.envelope, admission);
+      // Bug 根因：首输入标题先于 deferred 提升发出，列表会过滤它；ACK 后若初始化/Hook
+      // 尚未结束便没有下一事件。沿用成功执行边界补发当前摘要，不等待 TurnStarted。
+      const admittedSessionId =
+        result?.type === "createSession" ? result.sessionId : outcome.envelope.sessionId;
+      if (admittedSessionId) this.publishCurrentSummaryToIndex(admittedSessionId);
       // 新建/侧聊命令采用结果会话的开关，避免把父会话或当前 App 设置误记到新会话。
       const telemetrySessionId =
         result?.type === "createSession" || result?.type === "createSelectionSideSession"
@@ -2681,12 +2850,12 @@ export class ConversationV4Gateway {
     return this.publishers.get(sessionId)?.getTurnRewindAnchor(rowId) ?? null;
   }
 
-  /** 会话关闭：清 publisher 与其全部订阅调度；hydration 标记同清（重开走冷启动重建）；
-   *  并从其 workspace index 移除该会话（session.removed 推给列表订阅者）。 */
-  disposeSession(sessionId: string): void {
+  /** 关闭只释放运行态；只有 CLI 已持久化软删除时才向列表发 session.removed。
+   * 修复原因：Host 将 removed 视为删除事实，普通 tab 关闭不能删除持久化会话。 */
+  disposeSession(sessionId: string, options: { deleted?: boolean } = {}): void {
     this.cleanupSessionRuntime(sessionId, {
       clearCommandInbox: false,
-      notifyIndexRemoved: true,
+      notifyIndexRemoved: options.deleted === true,
     });
   }
 
@@ -2778,6 +2947,7 @@ export class ConversationV4Gateway {
     this.hydrationBuffers.delete(sessionId);
     this.hydrationInFlight.delete(sessionId);
     this.readyFlights.delete(sessionId);
+    this.historyOpenings.get(sessionId)?.cancel();
     this.rawSequenceStates.delete(sessionId);
     if (options.clearCommandInbox) this.inbox.clearSession(sessionId);
     this.telemetryNormalizer.clearSession(sessionId);
@@ -2830,6 +3000,8 @@ export class ConversationV4Gateway {
     this.hydrationBuffers.clear();
     this.hydrationInFlight.clear();
     this.readyFlights.clear();
+    for (const opening of this.historyOpenings.values()) opening.cancel();
+    this.historyOpenings.clear();
     this.rawSequenceStates.clear();
     this.telemetryEventIds.clear();
     this.detachedLiveSessions.clear();
@@ -2892,6 +3064,138 @@ export class ConversationV4Gateway {
     }
   }
 
+  /** 首帧先落 transport queue，再启动会同步扫描插件的 runtime；重连不重跑失败 hook。 */
+  private ensureHistoryReadyPublisher(
+    sessionId: string,
+    thought?: string,
+    workspace?: ZCodeWorkspaceRef,
+    additionalDirectories?: string[],
+    retryAttempt?: string,
+  ): Promise<ConversationTopicPublisher> {
+    const existing = this.historyOpenings.get(sessionId);
+    if (existing) return existing.history;
+    const publisher = this.publishers.get(sessionId);
+    const failed = publisher?.getSnapshot().runtimeInitialization;
+    if (failed?.status === "failed" && failed.attemptId !== retryAttempt)
+      return Promise.resolve(publisher!);
+    // 失败 app 已回收，旧 raw tail 不属于下一次 runtime 的事件水位。
+    if (failed?.status === "failed") this.rawSequenceStates.delete(sessionId);
+    const attemptId = randomUUID();
+    const initializationStartedAt = performance.now();
+    let resolveReady!: (publisher: ConversationTopicPublisher) => void;
+    let rejectReady!: (error: unknown) => void;
+    const ready = new Promise<ConversationTopicPublisher>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    // 没有旧客户端等待时失败也由状态条消费，避免无人 await 的 rejection。
+    void ready.catch(() => undefined);
+    this.readyFlights.set(sessionId, ready);
+    let messages: MessageWithParts[] | undefined;
+    let started = false;
+    const clear = () => {
+      messages = undefined;
+      if (this.readyFlights.get(sessionId) === ready) this.readyFlights.delete(sessionId);
+      if (this.historyOpenings.get(sessionId) === opening) this.historyOpenings.delete(sessionId);
+    };
+    const opening = {
+      cancel: () => {
+        rejectReady(new Error("cold opening disposed"));
+        clear();
+      },
+      history: Promise.resolve()
+        .then(async () => {
+          messages = await this.host.loadPersistedMessages!(sessionId);
+          if (this.disposed || this.historyOpenings.get(sessionId) !== opening)
+            throw new Error("cold opening disposed");
+          const result = await this.hydratePublisher(sessionId, messages, true);
+          this.setInitialization(sessionId, result, { status: "initializing", attemptId });
+          return result;
+        })
+        .catch((error: unknown) => {
+          rejectReady(error);
+          clear();
+          throw error;
+        }),
+      start: () => {
+        if (started) return;
+        started = true;
+        // post-response commit 已确认首帧入队；下一轮让 stdio I/O 有机会交付，不用定时猜测 UI。
+        setImmediate(() => {
+          let disposeOnFailure: (() => Promise<void>) | undefined;
+          let releaseRuntime: (() => void) | undefined;
+          void (async () => {
+            if (this.disposed || this.historyOpenings.get(sessionId) !== opening)
+              throw new Error("cold opening disposed");
+            releaseRuntime = await this.host.retainSessionRuntime?.(sessionId);
+            if (this.disposed || this.historyOpenings.get(sessionId) !== opening)
+              throw new Error("cold opening disposed");
+            const restored = await this.coldResume.ensureResumed(
+              sessionId,
+              thought,
+              workspace,
+              additionalDirectories,
+              messages,
+              (outcome) => {
+                disposeOnFailure = outcome.disposeOnFailure;
+              },
+            );
+            if (this.disposed || this.historyOpenings.get(sessionId) !== opening)
+              throw new Error("cold opening disposed");
+            const result = await this.hydratePublisher(sessionId, restored ?? messages, true);
+            this.setInitialization(sessionId, result, { status: "ready", attemptId });
+            this.host.onDebug?.(
+              `v4 runtime ready session=${sessionId} attempt=${attemptId} runtimeReadyMs=${Math.round(performance.now() - initializationStartedAt)}`,
+            );
+            resolveReady(result);
+          })()
+            .catch(async (error: unknown) => {
+              // activation 成功而最终物化失败时，也必须拆掉本次 app，下一次重试才会完整 resume。
+              await disposeOnFailure?.();
+              if (!this.disposed && this.historyOpenings.get(sessionId) === opening) {
+                const result = this.publishers.get(sessionId);
+                if (result)
+                  this.setInitialization(sessionId, result, {
+                    status: "failed",
+                    attemptId,
+                    reasonCode: "fault.subscribe.resumeFailed",
+                    message: error instanceof Error ? error.message : String(error),
+                  });
+                this.host.onError?.("v4.initialize", error, { sessionId, attemptId });
+              }
+              rejectReady(error);
+            })
+            .finally(() => {
+              releaseRuntime?.();
+              clear();
+            });
+        });
+      },
+    };
+    this.historyOpenings.set(sessionId, opening);
+    return opening.history;
+  }
+
+  private setInitialization(
+    sessionId: string,
+    publisher: ConversationTopicPublisher,
+    state: NonNullable<ConversationSnapshot["runtimeInitialization"]>,
+  ): void {
+    publisher.setRuntimeInitialization(state);
+    const sequence = this.rawSequenceStates.get(sessionId);
+    if (sequence) {
+      sequence.lastTransportSeq = publisher.getSnapshot().seq;
+      sequence.offset = sequence.lastTransportSeq - sequence.sourceEventSeq;
+    }
+    for (const connectionId of new Set(
+      [...this.flushStates.values()]
+        .filter((entry) => entry.sessionId === sessionId)
+        .map((entry) => entry.connectionId),
+    )) {
+      if (!this.pausedConnections.has(connectionId)) this.flushConnection(connectionId);
+    }
+  }
+
   /**
    * 冷恢复 READY 只在明确需要 activation 的入口创建；hydratePublisher 保持 projection-only。
    * 注册 promise 早于 activation，避免 record 提前入册后并发 command/query 越过恢复水位。
@@ -2900,6 +3204,7 @@ export class ConversationV4Gateway {
     sessionId: string,
     resumeThoughtLevel?: string,
     workspace?: ZCodeWorkspaceRef,
+    additionalDirectories?: string[],
   ): Promise<ConversationTopicPublisher> {
     const existingFlight = this.readyFlights.get(sessionId);
     if (existingFlight) return existingFlight;
@@ -2909,6 +3214,7 @@ export class ConversationV4Gateway {
         sessionId,
         resumeThoughtLevel,
         workspace,
+        additionalDirectories,
       );
       return this.hydratePublisher(sessionId, persistedMessages);
     });
@@ -2932,7 +3238,8 @@ export class ConversationV4Gateway {
   ): Promise<ConversationTopicPublisher> {
     const existing = this.publishers.get(sessionId);
     // 已 hydrate 过的 live publisher：直接复用（避免重复重建 / 双计）。
-    if (existing && this.hydratedSessions.has(sessionId)) return Promise.resolve(existing);
+    if (!forceRebuild && existing && this.hydratedSessions.has(sessionId))
+      return Promise.resolve(existing);
 
     const inFlight = this.hydrationInFlight.get(sessionId);
     if (inFlight) return inFlight;
@@ -2983,6 +3290,7 @@ export class ConversationV4Gateway {
             persistedMessages: persistedMessages?.length ?? 0,
             sessionId,
           });
+          if (this.historyOpenings.has(sessionId)) throw error;
           return { events: [] as SessionEvent[], synthesized: false, sourceEventSeq: 0 };
         })
       : { events: [] as SessionEvent[], synthesized: false, sourceEventSeq: 0 };

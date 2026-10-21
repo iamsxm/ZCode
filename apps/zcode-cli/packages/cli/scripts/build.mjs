@@ -1,9 +1,10 @@
 import { chmod, readFile, rm } from "node:fs/promises";
-import { readThirdPartyNotices, stageThirdPartyNotices } from "../../../../../scripts/third-party-notices.mjs";
 import { basename, dirname, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
+import sharedPackage from "../../../../../packages/shared/package.json" with { type: "json" };
 import { stageBuiltinProviderConfig } from "../../../../../scripts/builtin-provider-config.mjs";
+import { stageThirdPartyNotices } from "../../../../../scripts/third-party-notices.mjs";
 
 const cliRoot = resolve(import.meta.dirname, "..");
 const projectRoot = resolve(cliRoot, "../..");
@@ -137,67 +138,16 @@ export const resolveBuildAliases = ({
   rootDirectory = projectRoot,
 } = {}) => ({
   "@zcode/shared-types": resolve(cliDirectory, "../shared-types/dist/index.js"),
-  // plugin-host 启动只需这些独立入口，不能经通用 alias 重新求值 shared 总入口。
-  "@zcode/shared/runtime-env": resolve(rootDirectory, "../../packages/shared/src/runtimeEnv.ts"),
-  "@zcode/shared/mcp": resolve(rootDirectory, "../../packages/shared/src/mcp.ts"),
-  "@zcode/shared/runtime-tool-runtime": resolve(
-    rootDirectory,
-    "../../packages/shared/src/runtime-tool-runtime.ts",
+  // esbuild 会按前缀改写。曾多次漏加新子路径，导致入口文件被误当成目录；
+  // 直接从包的公开 exports 派生，并将通用入口放在最后，避免两份清单漂移。
+  ...Object.fromEntries(
+    Object.entries(sharedPackage.exports)
+      .sort(([a], [b]) => Number(a === ".") - Number(b === "."))
+      .map(([subpath, target]) => [
+        subpath === "." ? "@zcode/shared" : `@zcode/shared/${subpath.slice(2)}`,
+        resolve(rootDirectory, "../../packages/shared", target),
+      ]),
   ),
-  // esbuild alias 按前缀改写导入路径。所有 shared subpath 必须在通用入口前精确声明，
-  // 否则会被错误解析为 `src/index.ts/<subpath>` 并让 Desktop agent/SEA 打包失败。
-  "@zcode/shared/zcode-protocol-v4": resolve(
-    rootDirectory,
-    "../../packages/shared/src/zcode-protocol-v4/index.ts",
-  ),
-  // ModelSelection schema 改为 shared 单一事实源后新增了本子路径引用。
-  // esbuild alias 按前缀改写；若不在通用入口前精确声明，会错误拼到
-  // `src/index.ts/model-selection`，导致 Desktop agent 打包失败。
-  "@zcode/shared/model-selection": resolve(
-    rootDirectory,
-    "../../packages/shared/src/model-selection.ts",
-  ),
-  // 共享 Model Schema 新增的子路径不能被通用 alias 拼到 index.ts 后面。
-  "@zcode/shared/model-config": resolve(rootDirectory, "../../packages/shared/src/model-config.ts"),
-  // 进程异常边界在 bootstrap 之前使用该轻量契约，不能落入 shared 的通用前缀 alias。
-  "@zcode/shared/process-diagnostic": resolve(
-    rootDirectory,
-    "../../packages/shared/src/process-diagnostic.ts",
-  ),
-  "@zcode/shared/config-schema": resolve(
-    rootDirectory,
-    "../../packages/shared/src/config-schema.ts",
-  ),
-  "@zcode/shared/workspace-hook-discovery": resolve(
-    rootDirectory,
-    "../../packages/shared/src/workspace-hook-discovery.ts",
-  ),
-  // review controller 直连 WorkspaceHookMutationError 需要本精确
-  // alias（esbuild 前缀改写规则同上，漏声明会在 Desktop agent/SEA 打包失败）。
-  "@zcode/shared/workspace-hook-mutation": resolve(
-    rootDirectory,
-    "../../packages/shared/src/workspace-hook-mutation.ts",
-  ),
-  // verdict 直连 import 需要本精确 alias；漏声明会被通用
-  // "@zcode/shared" 前缀改写成 `src/index.ts/workspace-hook-review-monotonicity`，
-  // Desktop agent/SEA 打包直接失败。
-  "@zcode/shared/workspace-hook-review-monotonicity": resolve(
-    rootDirectory,
-    "../../packages/shared/src/workspace-hook-review-monotonicity.ts",
-  ),
-  // trust store 文件 schema 单源下沉后的新 subpath；漏声明会被通用
-  // "@zcode/shared" 前缀改写成 `src/index.ts/workspace-hook-trust-store-file`，
-  // Desktop agent/SEA 打包失败（同上两类既有规则）。
-  "@zcode/shared/workspace-hook-trust-store-file": resolve(
-    rootDirectory,
-    "../../packages/shared/src/workspace-hook-trust-store-file.ts",
-  ),
-  "@zcode/shared/zcodeEndpoint": resolve(
-    rootDirectory,
-    "../../packages/shared/src/zcodeEndpoint.ts",
-  ),
-  "@zcode/shared/node": resolve(rootDirectory, "../../packages/shared/src/node.ts"),
-  "@zcode/shared": resolve(rootDirectory, "../../packages/shared/src/index.ts"),
   "@zcode/core": resolve(cliDirectory, "../core/dist/index.js"),
 });
 
@@ -214,7 +164,6 @@ export const buildCli = async ({
   const cliVersion = await version;
   const outfile = resolve(cliDirectory, "dist/zcode.cjs");
   const sourcemapFile = `${outfile}.map`;
-  const notices = await readThirdPartyNotices(resolve(rootDirectory, "../.."));
 
   await stageBuiltinProviderConfig({
     root: resolve(rootDirectory, "../.."),
@@ -224,10 +173,8 @@ export const buildCli = async ({
 
   await build({
     banner: {
-      // SEA 与普通 CLI 共用入口；声明必须在 Agent 初始化和原生资源解压前可独立读取。
-      js: `#!/usr/bin/env node\n"use strict";\nif (process.argv.length === 3 && process.argv[2] === "--licenses") { const sea = require("node:sea"); const nodeNotice = sea.isSea() ? "\\n\\n## Bundled Node.js runtime\\n\\n" + sea.getAsset("zcode-node-license", "utf8") : ""; process.stdout.write(${JSON.stringify(notices.toString("utf8"))} + nodeNotice, () => process.exit(0)); } else {`,
+      js: "#!/usr/bin/env node",
     },
-    footer: { js: "}" },
     bundle: true,
     define: {
       __CLI_VERSION__: JSON.stringify(cliVersion),
@@ -266,6 +213,7 @@ export const buildCli = async ({
   }
 
   await chmod(outfile, executableFileMode);
+  // zcode.cjs 内联了第三方代码；dist 旁的伴随声明供发行 CLI 与统一分发包（build-zcode）复制。
   await stageThirdPartyNotices(resolve(cliDirectory, "dist"), resolve(rootDirectory, "../.."));
 };
 
